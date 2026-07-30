@@ -37,5 +37,5 @@ class Settings(BaseSettings):
             "static_root",
         ):
             path = getattr(self, field_name)
-            setattr(self, field_name, path.expanduser().absolute())
+            setattr(self, field_name, path.expanduser().resolve(strict=False))
         return self

@@ -44,6 +44,19 @@ def test_settings_allow_an_empty_api_key(tmp_path: Path) -> None:
     assert settings.llm_api_key == ""
 
 
+def test_settings_collapse_parent_segments_in_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    settings = Settings(
+        workspace_root=Path("intermediate") / ".." / "canonical",
+    )
+
+    assert settings.workspace_root == tmp_path / "canonical"
+
+
 @pytest.mark.parametrize(
     ("field_name", "invalid_value"),
     [
@@ -67,3 +80,29 @@ def test_settings_reject_values_outside_limits(
 ) -> None:
     with pytest.raises(ValidationError):
         Settings(**{field_name: invalid_value})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "boundary_value"),
+    [
+        ("max_model_calls", 1),
+        ("max_model_calls", 100),
+        ("max_concurrent_runs", 1),
+        ("max_concurrent_runs", 8),
+        ("max_read_bytes", 1024),
+        ("max_read_bytes", 65536),
+        ("max_write_bytes", 1024),
+        ("max_write_bytes", 1048576),
+        ("request_timeout_seconds", 5.0),
+        ("request_timeout_seconds", 180.0),
+        ("rate_limit_per_minute", 1),
+        ("rate_limit_per_minute", 120),
+    ],
+)
+def test_settings_accept_values_at_limit_boundaries(
+    field_name: str,
+    boundary_value: int | float,
+) -> None:
+    settings = Settings(**{field_name: boundary_value})
+
+    assert getattr(settings, field_name) == boundary_value
