@@ -1,6 +1,11 @@
+import base64
+import binascii
 import codecs
 import hashlib
+import hmac
+import json
 import os
+import secrets
 import stat
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -18,6 +23,7 @@ _MAX_WARNING_CHARS = 500
 _MAX_SNIPPET_CHARS = 500
 _SEARCH_SEGMENT_CHARS = 4096
 _MAX_CHARACTER_PROBE_BYTES = 8
+_CURSOR_VERSION = 1
 
 
 class ToolInputError(ValueError):
@@ -49,24 +55,36 @@ def _detect_encoding(
     with sample_path.open("rb") as handle:
         sample = handle.read(_DETECTION_BYTES)
 
+    if sample.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        raise ToolInputError(
+            "UTF-32 is not supported",
+            "UNSUPPORTED_ENCODING",
+        )
+
     has_utf16_bom = sample.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
     if b"\x00" in sample and not has_utf16_bom:
         raise ToolInputError("file appears to be binary", "BINARY_FILE")
 
+    size_path = revalidate()
+    size = os.lstat(size_path).st_size
+    final = size <= len(sample)
     if has_utf16_bom:
         candidates = ("utf-16",)
     else:
         candidates = ("utf-8-sig", "gb18030")
 
-    size_path = revalidate()
-    size = os.lstat(size_path).st_size
-    final = size <= len(sample)
     for encoding in candidates:
         decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
         try:
             decoder.decode(sample, final=final)
         except UnicodeDecodeError:
             continue
+        if (
+            encoding == "utf-8-sig"
+            and size > len(sample)
+            and sample.isascii()
+        ):
+            return "utf-8-or-gb18030"
         return encoding
 
     raise ToolInputError(
@@ -103,12 +121,55 @@ def _path_type(metadata: os.stat_result) -> str:
     return "other"
 
 
-def _parse_cursor(cursor: str | None) -> int:
-    if cursor is None:
-        return 0
-    if not isinstance(cursor, str) or not cursor.isdecimal():
-        raise ToolInputError("cursor must be a decimal string", "INVALID_CURSOR")
-    return int(cursor)
+def _base64_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _base64_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    try:
+        decoded = base64.b64decode(
+            value + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+    except (binascii.Error, ValueError) as error:
+        raise ToolInputError("cursor is malformed", "INVALID_CURSOR") from error
+    if _base64_encode(decoded) != value:
+        raise ToolInputError("cursor is malformed", "INVALID_CURSOR")
+    return decoded
+
+
+def _encode_cursor(payload: dict[str, Any], key: bytes) -> str:
+    raw = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    signature = hmac.new(key, raw, hashlib.sha256).digest()
+    return f"{_base64_encode(raw)}.{_base64_encode(signature)}"
+
+
+def _decode_cursor(cursor: str, key: bytes) -> dict[str, Any]:
+    if not isinstance(cursor, str):
+        raise ToolInputError("cursor must be a string", "INVALID_CURSOR")
+    try:
+        payload_part, signature_part = cursor.split(".")
+    except ValueError as error:
+        raise ToolInputError("cursor is malformed", "INVALID_CURSOR") from error
+    raw = _base64_decode(payload_part)
+    signature = _base64_decode(signature_part)
+    expected = hmac.new(key, raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(signature, expected):
+        raise ToolInputError("cursor authentication failed", "INVALID_CURSOR")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ToolInputError("cursor is malformed", "INVALID_CURSOR") from error
+    if not isinstance(payload, dict) or payload.get("v") != _CURSOR_VERSION:
+        raise ToolInputError("cursor version is invalid", "INVALID_CURSOR")
+    return payload
 
 
 def _bounded_int(
@@ -205,6 +266,7 @@ class WorkspaceTools:
             maximum=2**31 - 1,
         )
         self.guard = guard
+        self._cursor_key = secrets.token_bytes(32)
 
     def list_dir(
         self,
@@ -214,7 +276,6 @@ class WorkspaceTools:
         limit: int = 100,
     ) -> ToolResult:
         try:
-            start = _parse_cursor(cursor)
             page_size = _bounded_int(
                 limit,
                 name="limit",
@@ -233,14 +294,52 @@ class WorkspaceTools:
                     "NOT_A_DIRECTORY",
                 )
 
+            relative_scope = _relative(self.guard.root, resolved)
+            after: str | None = None
+            if cursor is not None:
+                payload = _decode_cursor(cursor, self._cursor_key)
+                if (
+                    payload.get("op") != "list"
+                    or payload.get("path") != relative_scope
+                    or payload.get("recursive") is not recursive
+                    or not isinstance(payload.get("last"), str)
+                ):
+                    raise ToolInputError(
+                        "cursor does not match list parameters",
+                        "INVALID_CURSOR",
+                    )
+                after = payload["last"]
+
             warnings: list[str] = []
-            entries = list(
-                self._iter_entries(path, recursive=recursive, warnings=warnings)
+            entries: list[dict[str, Any]] = []
+            iterator = self._iter_entries(
+                relative_scope,
+                recursive=recursive,
+                warnings=warnings,
+                after=after,
             )
-            entries.sort(key=lambda entry: entry["path"])
-            page = entries[start : start + page_size]
-            has_more = start + page_size < len(entries)
-            next_cursor = str(start + page_size) if has_more else None
+            try:
+                for entry in iterator:
+                    entries.append(entry)
+                    if len(entries) == page_size + 1:
+                        break
+            finally:
+                iterator.close()
+
+            has_more = len(entries) > page_size
+            page = entries[:page_size]
+            next_cursor = None
+            if has_more and page:
+                next_cursor = _encode_cursor(
+                    {
+                        "v": _CURSOR_VERSION,
+                        "op": "list",
+                        "path": relative_scope,
+                        "recursive": recursive,
+                        "last": page[-1]["path"],
+                    },
+                    self._cursor_key,
+                )
             return _success(
                 {
                     "entries": page,
@@ -266,7 +365,6 @@ class WorkspaceTools:
                 raise ToolInputError("query must be a non-empty string")
             if not isinstance(case_sensitive, bool):
                 raise ToolInputError("case_sensitive must be a boolean")
-            start = _parse_cursor(cursor)
             page_size = _bounded_int(
                 limit,
                 name="limit",
@@ -280,10 +378,51 @@ class WorkspaceTools:
 
             warnings: list[str] = []
             relative_scope = _relative(self.guard.root, resolved)
+            after_path: str | None = None
+            after_line = 0
+            if cursor is not None:
+                payload = _decode_cursor(cursor, self._cursor_key)
+                query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()
+                if (
+                    payload.get("op") != "search"
+                    or payload.get("path") != relative_scope
+                    or payload.get("query_sha256") != query_hash
+                    or payload.get("case_sensitive") is not case_sensitive
+                    or not isinstance(payload.get("last_path"), str)
+                    or not isinstance(payload.get("last_line"), int)
+                    or not isinstance(payload.get("size"), int)
+                    or not isinstance(payload.get("mtime_ns"), int)
+                ):
+                    raise ToolInputError(
+                        "cursor does not match search parameters",
+                        "INVALID_CURSOR",
+                    )
+                after_path = payload["last_path"]
+                after_line = payload["last_line"]
+                try:
+                    _, anchor_metadata = self._resolve_regular_file(after_path)
+                except (FileNotFoundError, OSError, PathRejected, ToolInputError):
+                    raise ToolInputError(
+                        "search cursor anchor changed",
+                        "STALE_CURSOR",
+                    )
+                if (
+                    anchor_metadata.st_size != payload["size"]
+                    or anchor_metadata.st_mtime_ns != payload["mtime_ns"]
+                ):
+                    raise ToolInputError(
+                        "search cursor anchor changed",
+                        "STALE_CURSOR",
+                    )
+
             if stat.S_ISREG(metadata.st_mode):
                 files: Iterator[str] = iter((relative_scope,))
             elif stat.S_ISDIR(metadata.st_mode):
-                files = self._iter_files(relative_scope, warnings)
+                files = self._iter_files(
+                    relative_scope,
+                    warnings,
+                    after_path=after_path,
+                )
             else:
                 raise ToolInputError(
                     "path must be a regular file or directory",
@@ -292,35 +431,59 @@ class WorkspaceTools:
 
             needle = query if case_sensitive else query.casefold()
             matches: list[dict[str, Any]] = []
-            seen = 0
             iterator = self._iter_matches(
                 files,
                 needle,
                 case_sensitive,
                 warnings,
+                after_path=after_path,
+                after_line=after_line,
             )
             try:
                 for match in iterator:
-                    if seen >= start:
-                        matches.append(match)
-                        if len(matches) == page_size + 1:
-                            break
-                    seen += 1
+                    matches.append(match)
+                    if len(matches) == page_size + 1:
+                        break
             finally:
                 iterator.close()
 
             has_more = len(matches) > page_size
-            if has_more:
-                matches.pop()
-            next_cursor = str(start + page_size) if has_more else None
+            page = matches[:page_size]
+            next_cursor = None
+            if has_more and page:
+                last = page[-1]
+                next_cursor = _encode_cursor(
+                    {
+                        "v": _CURSOR_VERSION,
+                        "op": "search",
+                        "path": relative_scope,
+                        "query_sha256": hashlib.sha256(
+                            query.encode("utf-8")
+                        ).hexdigest(),
+                        "case_sensitive": case_sensitive,
+                        "last_path": last["path"],
+                        "last_line": last["line"],
+                        "size": last["_size"],
+                        "mtime_ns": last["_mtime_ns"],
+                    },
+                    self._cursor_key,
+                )
+            public_matches = [
+                {
+                    "path": match["path"],
+                    "line": match["line"],
+                    "snippet": match["snippet"],
+                }
+                for match in page
+            ]
             return _success(
                 {
-                    "matches": matches,
+                    "matches": public_matches,
                     "warnings": warnings,
                     "has_more": has_more,
                     "next_cursor": next_cursor,
                 },
-                f"Found {len(matches)} workspace matches",
+                f"Found {len(public_matches)} workspace matches",
             )
         except Exception as error:
             return _error_result("search_files", error)
@@ -329,7 +492,8 @@ class WorkspaceTools:
         self,
         path: str,
         offset: int = 0,
-        limit: int = 16384,
+        limit: int | None = None,
+        cursor: str | None = None,
     ) -> ToolResult:
         try:
             byte_offset = _bounded_int(
@@ -339,53 +503,120 @@ class WorkspaceTools:
                 maximum=2**63 - 1,
                 code="INVALID_OFFSET",
             )
+            requested_limit = (
+                min(16384, self.max_read_bytes)
+                if limit is None
+                else limit
+            )
             byte_limit = _bounded_int(
-                limit,
+                requested_limit,
                 name="limit",
                 minimum=1,
                 maximum=self.max_read_bytes,
             )
 
-            resolved, _ = self._resolve_regular_file(path)
-            encoding = _detect_encoding(
-                resolved,
-                revalidate=lambda: self.guard.resolve(
-                    path,
-                    must_exist=True,
-                ),
-            )
             resolved, metadata = self._resolve_regular_file(path)
+            relative_path = _relative(self.guard.root, resolved)
+            cursor_payload: dict[str, Any] | None = None
+            if cursor is not None:
+                cursor_payload = _decode_cursor(cursor, self._cursor_key)
+                if (
+                    cursor_payload.get("op") != "read"
+                    or cursor_payload.get("path") != relative_path
+                    or cursor_payload.get("offset") != byte_offset
+                    or cursor_payload.get("encoding")
+                    not in {
+                        "utf-8-sig",
+                        "utf-16",
+                        "gb18030",
+                        "utf-8-or-gb18030",
+                    }
+                    or not isinstance(cursor_payload.get("size"), int)
+                    or not isinstance(cursor_payload.get("mtime_ns"), int)
+                ):
+                    raise ToolInputError(
+                        "cursor does not match read parameters",
+                        "INVALID_CURSOR",
+                    )
+                if (
+                    metadata.st_size != cursor_payload["size"]
+                    or metadata.st_mtime_ns != cursor_payload["mtime_ns"]
+                ):
+                    raise ToolInputError(
+                        "read cursor file changed",
+                        "STALE_CURSOR",
+                    )
+                encoding = cursor_payload["encoding"]
+            else:
+                encoding = _detect_encoding(
+                    resolved,
+                    revalidate=lambda: self.guard.resolve(
+                        path,
+                        must_exist=True,
+                    ),
+                )
+
             size = metadata.st_size
-            if byte_offset > size or not self._is_character_boundary(
-                path,
-                byte_offset,
-                encoding,
-            ):
+            if byte_offset > size:
                 raise ToolInputError(
                     "offset is not a valid character boundary",
                     "INVALID_OFFSET",
                 )
+            if cursor_payload is None and byte_offset:
+                if encoding == "gb18030":
+                    raise ToolInputError(
+                        "GB18030 offsets require a continuation cursor",
+                        "OFFSET_REQUIRES_CURSOR",
+                    )
+                if not self._is_character_boundary(
+                    path,
+                    byte_offset,
+                    encoding,
+                ):
+                    code = (
+                        "OFFSET_REQUIRES_CURSOR"
+                        if encoding == "utf-8-or-gb18030"
+                        else "INVALID_OFFSET"
+                    )
+                    raise ToolInputError(
+                        "offset is not a valid character boundary",
+                        code,
+                    )
+                if (
+                    encoding == "utf-8-or-gb18030"
+                    and not self._next_character_is_utf8(
+                        path,
+                        byte_offset,
+                        size,
+                    )
+                ):
+                    raise ToolInputError(
+                        "GB18030 offsets require a continuation cursor",
+                        "OFFSET_REQUIRES_CURSOR",
+                    )
 
             _, handle = self._open_file(path, "rb")
             with handle:
                 handle.seek(byte_offset)
                 chunk = handle.read(min(byte_limit, metadata.st_size - byte_offset))
 
-            decoder_encoding = self._decoder_encoding(
+            content, consumed, selected_encoding = self._decode_read_chunk(
                 path,
                 encoding,
                 byte_offset,
+                chunk,
+                byte_offset + len(chunk) == metadata.st_size,
             )
-            decoder = codecs.getincrementaldecoder(decoder_encoding)(
-                errors="strict"
-            )
-            content = decoder.decode(chunk, final=False)
-            buffered, _ = decoder.getstate()
-            consumed = len(chunk) - len(buffered)
-            reaches_eof = byte_offset + len(chunk) == metadata.st_size
-            if reaches_eof:
-                content += decoder.decode(b"", final=True)
-                consumed = len(chunk)
+            if (
+                cursor_payload is None
+                and byte_offset
+                and encoding == "utf-8-or-gb18030"
+                and selected_encoding == "gb18030"
+            ):
+                raise ToolInputError(
+                    "GB18030 offsets require a continuation cursor",
+                    "OFFSET_REQUIRES_CURSOR",
+                )
 
             next_offset = byte_offset + consumed
             has_more = next_offset < metadata.st_size
@@ -393,7 +624,7 @@ class WorkspaceTools:
                 minimum_bytes = self._minimum_character_bytes(
                     path,
                     byte_offset,
-                    encoding,
+                    selected_encoding,
                 )
                 data = (
                     {"minimum_bytes": minimum_bytes}
@@ -405,7 +636,20 @@ class WorkspaceTools:
                     "LIMIT_SPLITS_CHARACTER",
                     data,
                 )
-            relative_path = _relative(self.guard.root, resolved)
+            next_cursor = None
+            if has_more:
+                next_cursor = _encode_cursor(
+                    {
+                        "v": _CURSOR_VERSION,
+                        "op": "read",
+                        "path": relative_path,
+                        "offset": next_offset,
+                        "encoding": selected_encoding,
+                        "size": metadata.st_size,
+                        "mtime_ns": metadata.st_mtime_ns,
+                    },
+                    self._cursor_key,
+                )
             return _success(
                 {
                     "path": relative_path,
@@ -413,7 +657,8 @@ class WorkspaceTools:
                     "offset": byte_offset,
                     "next_offset": next_offset,
                     "has_more": has_more,
-                    "encoding": encoding,
+                    "encoding": selected_encoding,
+                    "next_cursor": next_cursor,
                 },
                 f"Read {consumed} bytes from {relative_path}",
             )
@@ -490,12 +735,27 @@ class WorkspaceTools:
         *,
         recursive: bool,
         warnings: list[str],
+        _nested: bool = False,
+        after: str | None = None,
     ) -> Iterator[dict[str, Any]]:
-        _, metadata = self._lstat(directory)
-        if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        try:
+            _, metadata = self._lstat(directory)
+            if _is_link_or_reparse(metadata) or not stat.S_ISDIR(
+                metadata.st_mode
+            ):
+                return
+            names = self._scan_names(directory)
+        except (FileNotFoundError, OSError, PathRejected):
+            if not _nested:
+                raise
+            _warning(
+                warnings,
+                f"Skipped unreadable directory: {directory}",
+            )
             return
 
-        for name in self._scan_names(directory):
+        candidates: list[tuple[str, str, dict[str, Any] | str]] = []
+        for name in names:
             relative_path = (
                 name if directory == "." else f"{directory.rstrip('/')}/{name}"
             )
@@ -515,30 +775,62 @@ class WorkspaceTools:
                 continue
 
             kind = _path_type(child_metadata)
-            yield {
+            entry = {
                 "path": _relative(self.guard.root, child),
                 "type": kind,
                 "size": child_metadata.st_size,
                 "modified_at": _modified_at(child_metadata),
             }
+            candidates.append((relative_path, "emit", entry))
             if recursive and kind == "directory":
+                candidates.append((f"{relative_path}/", "recurse", relative_path))
+
+        for _, action, value in sorted(candidates, key=lambda item: item[0]):
+            if action == "emit":
+                entry = value  # type: ignore[assignment]
+                if after is None or entry["path"] > after:
+                    yield entry
+            else:
+                prefix = f"{value}/"
+                if (
+                    after is not None
+                    and prefix <= after
+                    and not after.startswith(prefix)
+                ):
+                    continue
                 yield from self._iter_entries(
-                    relative_path,
+                    value,  # type: ignore[arg-type]
                     recursive=True,
                     warnings=warnings,
+                    _nested=True,
+                    after=after,
                 )
 
     def _iter_files(
         self,
         directory: str,
         warnings: list[str],
+        _nested: bool = False,
+        after_path: str | None = None,
     ) -> Iterator[str]:
-        _, metadata = self._lstat(directory)
-        if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        try:
+            _, metadata = self._lstat(directory)
+            if _is_link_or_reparse(metadata) or not stat.S_ISDIR(
+                metadata.st_mode
+            ):
+                return
+            names = self._scan_names(directory)
+        except (FileNotFoundError, OSError, PathRejected):
+            if not _nested:
+                raise
+            _warning(
+                warnings,
+                f"Skipped unreadable directory: {directory}",
+            )
             return
 
         candidates: list[tuple[str, str, str]] = []
-        for name in self._scan_names(directory):
+        for name in names:
             relative_path = (
                 name if directory == "." else f"{directory.rstrip('/')}/{name}"
             )
@@ -565,9 +857,22 @@ class WorkspaceTools:
 
         for _, relative_path, kind in sorted(candidates):
             if kind == "file":
-                yield relative_path
+                if after_path is None or relative_path >= after_path:
+                    yield relative_path
             else:
-                yield from self._iter_files(relative_path, warnings)
+                prefix = f"{relative_path}/"
+                if (
+                    after_path is not None
+                    and prefix < after_path
+                    and not after_path.startswith(prefix)
+                ):
+                    continue
+                yield from self._iter_files(
+                    relative_path,
+                    warnings,
+                    _nested=True,
+                    after_path=after_path,
+                )
 
     def _iter_matches(
         self,
@@ -575,10 +880,15 @@ class WorkspaceTools:
         needle: str,
         case_sensitive: bool,
         warnings: list[str],
+        *,
+        after_path: str | None = None,
+        after_line: int = 0,
     ) -> Iterator[dict[str, Any]]:
         for relative_path in files:
+            if after_path is not None and relative_path < after_path:
+                continue
             try:
-                resolved, _ = self._resolve_regular_file(relative_path)
+                resolved, metadata = self._resolve_regular_file(relative_path)
                 encoding = _detect_encoding(
                     resolved,
                     revalidate=lambda: self.guard.resolve(
@@ -586,6 +896,15 @@ class WorkspaceTools:
                         must_exist=True,
                     ),
                 )
+                if encoding == "utf-8-or-gb18030":
+                    encoding = (
+                        "utf-8-sig"
+                        if self._stream_decodes(
+                            relative_path,
+                            "utf-8-sig",
+                        )
+                        else "gb18030"
+                    )
                 _, handle = self._open_file(
                     relative_path,
                     "r",
@@ -599,10 +918,17 @@ class WorkspaceTools:
                         needle,
                         case_sensitive,
                     ):
+                        if (
+                            relative_path == after_path
+                            and line_number <= after_line
+                        ):
+                            continue
                         yield {
                             "path": relative_path,
                             "line": line_number,
                             "snippet": snippet,
+                            "_size": metadata.st_size,
+                            "_mtime_ns": metadata.st_mtime_ns,
                         }
             except ToolInputError as error:
                 _warning(
@@ -620,6 +946,24 @@ class WorkspaceTools:
                     f"Skipped {relative_path}: file could not be read safely",
                 )
 
+    def _stream_decodes(
+        self,
+        relative_path: str,
+        encoding: str,
+    ) -> bool:
+        decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+        _, handle = self._open_file(relative_path, "rb")
+        try:
+            with handle:
+                while True:
+                    chunk = handle.read(_SEARCH_SEGMENT_CHARS)
+                    if not chunk:
+                        decoder.decode(b"", final=True)
+                        return True
+                    decoder.decode(chunk, final=False)
+        except UnicodeDecodeError:
+            return False
+
     @staticmethod
     def _bounded_line_matches(
         handle,
@@ -628,7 +972,7 @@ class WorkspaceTools:
     ) -> Iterator[tuple[int, str]]:
         line_number = 1
         carry = ""
-        snippet = ""
+        line_tail = ""
         matched = False
         carry_size = max(len(needle) - 1, 0)
 
@@ -637,23 +981,37 @@ class WorkspaceTools:
             if segment == "":
                 return
 
-            if len(snippet) < _MAX_SNIPPET_CHARS:
-                remaining = _MAX_SNIPPET_CHARS - len(snippet)
-                snippet += segment[:remaining]
-
             searchable = segment if case_sensitive else segment.casefold()
             combined = carry + searchable
             if not matched and needle in combined:
-                yield line_number, snippet.rstrip("\r\n")
+                snippet_source = line_tail + segment
+                snippet_searchable = (
+                    snippet_source
+                    if case_sensitive
+                    else snippet_source.casefold()
+                )
+                match_index = snippet_searchable.find(needle)
+                if match_index < 0:
+                    match_index = max(
+                        0,
+                        len(snippet_source) - len(segment),
+                    )
+                start = max(0, match_index - 100)
+                snippet = snippet_source[
+                    start : start + _MAX_SNIPPET_CHARS
+                ].rstrip("\r\n")
+                yield line_number, snippet
                 matched = True
 
             if segment.endswith("\n"):
                 line_number += 1
                 carry = ""
-                snippet = ""
+                line_tail = ""
                 matched = False
-            elif carry_size:
-                carry = combined[-carry_size:]
+            else:
+                line_tail = (line_tail + segment)[-_MAX_SNIPPET_CHARS:]
+                if carry_size:
+                    carry = combined[-carry_size:]
 
     def _is_character_boundary(
         self,
@@ -667,19 +1025,154 @@ class WorkspaceTools:
         _, metadata = self._resolve_regular_file(relative_path)
         if offset > metadata.st_size:
             return False
+        if encoding in {"utf-8-sig", "utf-8-or-gb18030"}:
+            start = max(0, offset - 4)
+            probe = self._read_bytes(
+                relative_path,
+                start,
+                min(8, metadata.st_size - start),
+            )
+            index = offset - start
+            if index < len(probe) and probe[index] & 0xC0 == 0x80:
+                return False
+            prefix = probe[:index]
+            if not prefix:
+                return True
+            continuation_count = 0
+            position = len(prefix) - 1
+            while position >= 0 and prefix[position] & 0xC0 == 0x80:
+                continuation_count += 1
+                position -= 1
+            if position < 0:
+                return False
+            lead = prefix[position]
+            if lead < 0x80:
+                expected = 1
+            elif 0xC2 <= lead <= 0xDF:
+                expected = 2
+            elif 0xE0 <= lead <= 0xEF:
+                expected = 3
+            elif 0xF0 <= lead <= 0xF4:
+                expected = 4
+            else:
+                return False
+            return continuation_count + 1 == expected
+        if encoding == "utf-16":
+            if offset < 2 or (offset - 2) % 2:
+                return False
+            bom = self._read_bytes(relative_path, 0, 2)
+            byteorder = (
+                "little" if bom == codecs.BOM_UTF16_LE else "big"
+            )
+            start = max(2, offset - 2)
+            probe = self._read_bytes(
+                relative_path,
+                start,
+                min(4, metadata.st_size - start),
+            )
+            if offset == 2:
+                return True
+            previous = int.from_bytes(probe[:2], byteorder)
+            current = (
+                int.from_bytes(probe[2:4], byteorder)
+                if len(probe) >= 4
+                else None
+            )
+            return not (
+                0xD800 <= previous <= 0xDBFF
+                and current is not None
+                and 0xDC00 <= current <= 0xDFFF
+            )
+        return False
 
-        decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
-        remaining = offset
+    def _read_bytes(
+        self,
+        relative_path: str,
+        offset: int,
+        size: int,
+    ) -> bytes:
         _, handle = self._open_file(relative_path, "rb")
         with handle:
-            while remaining:
-                chunk = handle.read(min(_HASH_CHUNK_BYTES, remaining))
-                if not chunk:
-                    return False
-                decoder.decode(chunk, final=False)
-                remaining -= len(chunk)
-        buffered, _ = decoder.getstate()
-        return not buffered
+            handle.seek(offset)
+            return handle.read(size)
+
+    def _next_character_is_utf8(
+        self,
+        relative_path: str,
+        offset: int,
+        file_size: int,
+    ) -> bool:
+        probe = self._read_bytes(
+            relative_path,
+            offset,
+            min(4, file_size - offset),
+        )
+        if not probe:
+            return True
+
+        first = probe[0]
+        if first < 0x80:
+            needed = 1
+        elif 0xC2 <= first <= 0xDF:
+            needed = 2
+        elif 0xE0 <= first <= 0xEF:
+            needed = 3
+        elif 0xF0 <= first <= 0xF4:
+            needed = 4
+        else:
+            return False
+
+        if len(probe) < needed:
+            return False
+        try:
+            probe[:needed].decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            return False
+        return True
+
+    def _decode_read_chunk(
+        self,
+        relative_path: str,
+        encoding: str,
+        offset: int,
+        chunk: bytes,
+        reaches_eof: bool,
+    ) -> tuple[str, int, str]:
+        candidates = (
+            ("utf-8-sig", "gb18030")
+            if encoding == "utf-8-or-gb18030"
+            else (encoding,)
+        )
+        last_error: UnicodeDecodeError | None = None
+        for candidate in candidates:
+            decoder_encoding = self._decoder_encoding(
+                relative_path,
+                candidate,
+                offset,
+            )
+            decoder = codecs.getincrementaldecoder(decoder_encoding)(
+                errors="strict"
+            )
+            try:
+                content = decoder.decode(chunk, final=False)
+                buffered, _ = decoder.getstate()
+                consumed = len(chunk) - len(buffered)
+                if reaches_eof:
+                    content += decoder.decode(b"", final=True)
+                    consumed = len(chunk)
+            except UnicodeDecodeError as error:
+                last_error = error
+                continue
+            selected = candidate
+            if (
+                encoding == "utf-8-or-gb18030"
+                and candidate == "utf-8-sig"
+                and chunk.isascii()
+            ):
+                selected = encoding
+            return content, consumed, selected
+        assert last_error is not None
+        raise last_error
 
     def _decoder_encoding(
         self,

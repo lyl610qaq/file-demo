@@ -1,3 +1,4 @@
+import codecs
 import hashlib
 import importlib
 import os
@@ -59,7 +60,8 @@ def test_list_dir_sorts_nonrecursive_entries_and_paginates(
         "m.txt",
     ]
     assert first.data["has_more"] is True
-    assert first.data["next_cursor"] == "2"
+    assert isinstance(first.data["next_cursor"], str)
+    assert not first.data["next_cursor"].isdecimal()
     assert [entry["path"] for entry in second.data["entries"]] == ["z.txt"]
     assert second.data["has_more"] is False
     assert second.data["next_cursor"] is None
@@ -170,7 +172,8 @@ def test_search_files_paginates_without_duplicate_or_missing_matches(
     combined = first.data["matches"] + second.data["matches"]
 
     assert first.data["has_more"] is True
-    assert first.data["next_cursor"] == "3"
+    assert isinstance(first.data["next_cursor"], str)
+    assert not first.data["next_cursor"].isdecimal()
     assert second.data["has_more"] is False
     assert [(item["path"], item["line"]) for item in combined] == [
         ("a.txt", 1),
@@ -178,6 +181,115 @@ def test_search_files_paginates_without_duplicate_or_missing_matches(
         ("b.txt", 1),
         ("b.txt", 2),
     ]
+
+
+def test_recursive_list_stops_after_limit_plus_one_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    deep = root / "a" / "first"
+    deep.mkdir(parents=True)
+    for index in range(2_000):
+        (deep / f"{index:04}.txt").write_text("x", encoding="utf-8")
+    tools = _tools(root)
+    original_scan_names = tools._scan_names
+    scanned: list[str] = []
+
+    def recording_scan_names(relative_path: str) -> list[str]:
+        scanned.append(relative_path)
+        if relative_path == "a/first":
+            raise AssertionError("early page consumed the deep subtree")
+        return original_scan_names(relative_path)
+
+    monkeypatch.setattr(tools, "_scan_names", recording_scan_names)
+
+    result = tools.list_dir(recursive=True, limit=1)
+
+    assert result.ok
+    assert [entry["path"] for entry in result.data["entries"]] == ["a"]
+    assert result.data["has_more"] is True
+    assert "a/first" not in scanned
+
+
+def test_list_cursor_is_bound_and_ignores_insertions_before_page(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "b.txt").write_text("b", encoding="utf-8")
+    (root / "c.txt").write_text("c", encoding="utf-8")
+    tools = _tools(root)
+
+    first = tools.list_dir(limit=1)
+    (root / "a.txt").write_text("a", encoding="utf-8")
+    second = tools.list_dir(cursor=first.data["next_cursor"], limit=2)
+    mismatch = tools.list_dir(
+        recursive=True,
+        cursor=first.data["next_cursor"],
+        limit=1,
+    )
+
+    assert [entry["path"] for entry in first.data["entries"]] == ["b.txt"]
+    assert [entry["path"] for entry in second.data["entries"]] == ["c.txt"]
+    assert mismatch.ok is False
+    assert mismatch.error_code == "INVALID_CURSOR"
+
+
+def test_search_cursor_is_bound_and_ignores_insertions_before_page(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "b.txt").write_text("hit b", encoding="utf-8")
+    (root / "c.txt").write_text("hit c", encoding="utf-8")
+    tools = _tools(root)
+
+    first = tools.search_files("hit", limit=1)
+    (root / "a.txt").write_text("hit a", encoding="utf-8")
+    second = tools.search_files(
+        "hit",
+        cursor=first.data["next_cursor"],
+        limit=2,
+    )
+    mismatch = tools.search_files(
+        "different",
+        cursor=first.data["next_cursor"],
+        limit=1,
+    )
+
+    assert [(item["path"], item["line"]) for item in first.data["matches"]] == [
+        ("b.txt", 1)
+    ]
+    assert [(item["path"], item["line"]) for item in second.data["matches"]] == [
+        ("c.txt", 1)
+    ]
+    assert mismatch.ok is False
+    assert mismatch.error_code == "INVALID_CURSOR"
+
+
+def test_search_cursor_detects_changed_last_file(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "a.txt"
+    target.write_text("hit one\nhit two\n", encoding="utf-8")
+    tools = _tools(root)
+
+    first = tools.search_files("hit", limit=1)
+    target.write_text("hit changed\nhit two\n", encoding="utf-8")
+    metadata = target.stat()
+    os.utime(
+        target,
+        ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
+    )
+    resumed = tools.search_files(
+        "hit",
+        cursor=first.data["next_cursor"],
+        limit=1,
+    )
+
+    assert resumed.ok is False
+    assert resumed.error_code == "STALE_CURSOR"
 
 
 def test_search_files_bounds_snippets_and_warns_for_binary_files(
@@ -302,6 +414,70 @@ def test_search_files_bounds_multi_megabyte_logical_lines_and_carry(
     assert readline_sizes
 
 
+def test_late_huge_line_match_is_in_bounded_snippet(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    query = "late-boundary-query"
+    (root / "late.txt").write_text(
+        ("x" * (2 * 1024 * 1024)) + query + ("y" * 2_000),
+        encoding="utf-8",
+    )
+
+    result = _tools(root).search_files(query)
+
+    snippet = result.data["matches"][0]["snippet"]
+    assert len(snippet) <= 500
+    assert query in snippet
+
+
+def test_nested_scan_errors_warn_and_preserve_readable_siblings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    (root / "blocked").mkdir(parents=True)
+    (root / "blocked" / "secret.txt").write_text("hit", encoding="utf-8")
+    (root / "readable").mkdir()
+    (root / "readable" / "good.txt").write_text("hit", encoding="utf-8")
+    tools = _tools(root)
+    original_scan_names = tools._scan_names
+
+    def denying_scan_names(relative_path: str) -> list[str]:
+        if relative_path == "blocked":
+            raise PermissionError("denied")
+        return original_scan_names(relative_path)
+
+    monkeypatch.setattr(tools, "_scan_names", denying_scan_names)
+
+    listed = tools.list_dir(recursive=True)
+    searched = tools.search_files("hit")
+
+    assert listed.ok
+    assert "readable/good.txt" in {
+        entry["path"] for entry in listed.data["entries"]
+    }
+    assert any("blocked" in warning for warning in listed.data["warnings"])
+    assert searched.ok
+    assert [item["path"] for item in searched.data["matches"]] == [
+        "readable/good.txt"
+    ]
+    assert any("blocked" in warning for warning in searched.data["warnings"])
+
+
+def test_read_file_default_limit_respects_configured_maximum(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "large.txt").write_text("x" * 2_000, encoding="utf-8")
+
+    result = _tools(root, max_read_bytes=1024).read_file("large.txt")
+
+    assert result.ok
+    assert len(result.data["content"].encode("utf-8")) == 1024
+    assert result.data["has_more"] is True
+
+
 def test_read_file_continues_on_utf8_character_boundaries(
     tmp_path: Path,
 ) -> None:
@@ -364,6 +540,200 @@ def test_read_file_fails_when_limit_cannot_make_character_progress(
     assert result.error_code == "LIMIT_SPLITS_CHARACTER"
     assert result.data == {"minimum_bytes": minimum_bytes}
     assert "next_offset" not in result.data
+
+
+def test_gb18030_reads_require_and_accept_authenticated_continuation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "gb.txt"
+    target.write_bytes("A😀B".encode("gb18030"))
+    tools = _tools(root, max_read_bytes=8)
+
+    first = tools.read_file("gb.txt", limit=1)
+    without_cursor = tools.read_file("gb.txt", offset=1, limit=4)
+    interior_offsets = [
+        tools.read_file("gb.txt", offset=offset, limit=1)
+        for offset in (2, 3, 4)
+    ]
+    second = tools.read_file(
+        "gb.txt",
+        offset=1,
+        limit=4,
+        cursor=first.data["next_cursor"],
+    )
+    third = tools.read_file(
+        "gb.txt",
+        offset=second.data["next_offset"],
+        limit=1,
+        cursor=second.data["next_cursor"],
+    )
+
+    assert first.data["content"] == "A"
+    assert first.data["next_offset"] == 1
+    assert without_cursor.error_code == "OFFSET_REQUIRES_CURSOR"
+    assert {
+        result.error_code for result in interior_offsets
+    } == {"OFFSET_REQUIRES_CURSOR"}
+    assert second.ok
+    assert second.data["content"] == "😀"
+    assert second.data["next_offset"] == 5
+    assert third.data["content"] == "B"
+
+
+def test_read_cursor_rejects_tampering_wrong_path_and_changed_file(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "gb.txt"
+    target.write_bytes("A中B".encode("gb18030"))
+    (root / "other.txt").write_text("other", encoding="utf-8")
+    tools = _tools(root, max_read_bytes=8)
+    first = tools.read_file("gb.txt", limit=1)
+    cursor = first.data["next_cursor"]
+    replacement = "A文B".encode("gb18030")
+
+    tampered = tools.read_file(
+        "gb.txt",
+        offset=1,
+        limit=2,
+        cursor=cursor[:-1] + ("A" if cursor[-1] != "A" else "B"),
+    )
+    wrong_path = tools.read_file(
+        "other.txt",
+        offset=1,
+        limit=2,
+        cursor=cursor,
+    )
+    target.write_bytes(replacement)
+    metadata = target.stat()
+    os.utime(
+        target,
+        ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1_000_000),
+    )
+    stale = tools.read_file(
+        "gb.txt",
+        offset=1,
+        limit=2,
+        cursor=cursor,
+    )
+
+    assert tampered.error_code == "INVALID_CURSOR"
+    assert wrong_path.error_code == "INVALID_CURSOR"
+    assert stale.error_code == "STALE_CURSOR"
+
+
+def test_deep_utf8_boundary_probe_does_not_read_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "large.txt"
+    size = 8 * 1024 * 1024
+    target.write_bytes(b"x" * (size - 1) + b"z")
+    tools = _tools(root)
+    original_open_file = tools._open_file
+    bytes_read = 0
+
+    class CountingReader:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+        def read(self, size: int = -1) -> bytes:
+            nonlocal bytes_read
+            data = self.handle.read(size)
+            bytes_read += len(data)
+            return data
+
+    def counting_open_file(relative_path: str, mode: str, **kwargs):
+        resolved, handle = original_open_file(relative_path, mode, **kwargs)
+        if relative_path == "large.txt" and mode == "rb":
+            handle = CountingReader(handle)
+        return resolved, handle
+
+    monkeypatch.setattr(tools, "_open_file", counting_open_file)
+
+    result = tools.read_file("large.txt", offset=size - 1, limit=1)
+
+    assert result.ok
+    assert result.data["content"] == "z"
+    assert bytes_read <= 32
+
+
+def test_utf16_surrogate_pair_boundaries_are_local_and_strict(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "utf16.txt").write_bytes("A😀B".encode("utf-16"))
+    tools = _tools(root)
+
+    middle = tools.read_file("utf16.txt", offset=6, limit=2)
+    after_pair = tools.read_file("utf16.txt", offset=8, limit=2)
+
+    assert middle.error_code == "INVALID_OFFSET"
+    assert after_pair.ok
+    assert after_pair.data["content"] == "B"
+
+
+def test_ascii_probe_then_gb18030_content_reads_and_searches(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    content = ("a" * 5_000) + "中文"
+    (root / "late-gb.txt").write_bytes(content.encode("gb18030"))
+    tools = _tools(root)
+
+    read = tools.read_file("late-gb.txt")
+    searched = tools.search_files("中文")
+    direct_offset = tools.read_file(
+        "late-gb.txt",
+        offset=5_000,
+        limit=1,
+    )
+
+    assert read.ok
+    assert read.data["content"] == content
+    assert read.data["encoding"] == "gb18030"
+    assert searched.ok
+    assert [(item["path"], item["line"]) for item in searched.data["matches"]] == [
+        ("late-gb.txt", 1)
+    ]
+    assert direct_offset.error_code == "OFFSET_REQUIRES_CURSOR"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        codecs.BOM_UTF32_LE + "hello".encode("utf-32-le"),
+        codecs.BOM_UTF32_BE + "hello".encode("utf-32-be"),
+    ],
+)
+def test_utf32_boms_are_rejected_explicitly(
+    tmp_path: Path,
+    payload: bytes,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "utf32.txt").write_bytes(payload)
+
+    result = _tools(root).read_file("utf32.txt")
+
+    assert result.ok is False
+    assert result.error_code == "UNSUPPORTED_ENCODING"
 
 
 @pytest.mark.parametrize(
