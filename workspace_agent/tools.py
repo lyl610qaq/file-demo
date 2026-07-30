@@ -1084,6 +1084,11 @@ class WorkspaceTools:
                             pending[candidate] = pending[candidate][
                                 len(common):
                             ]
+                    if final:
+                        preferred = next(iter(decoders))
+                        if pending[preferred]:
+                            yield pending[preferred]
+                        return
                     if any(
                         len(text) > _MAX_AMBIGUOUS_TEXT_CHARS
                         for text in pending.values()
@@ -1093,11 +1098,6 @@ class WorkspaceTools:
                             "CHARSET_UNDETERMINED",
                         )
                 if final:
-                    if len(decoders) > 1 and any(pending.values()):
-                        raise ToolInputError(
-                            "file charset remains ambiguous",
-                            "CHARSET_UNDETERMINED",
-                        )
                     return
 
     @staticmethod
@@ -1331,6 +1331,14 @@ class WorkspaceTools:
 
         contents = [result[0] for result in results.values()]
         consumed_values = {result[1] for result in results.values()}
+        if reaches_eof and len(set(contents)) > 1:
+            selected = next(
+                candidate
+                for candidate in candidates
+                if candidate in results
+            )
+            content, consumed = results[selected]
+            return content, consumed, selected, (selected,)
         if len(set(contents)) == 1 and len(consumed_values) == 1:
             consumed = consumed_values.pop()
             return (

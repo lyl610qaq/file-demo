@@ -899,6 +899,63 @@ def test_ambiguous_cursor_pending_bytes_still_honor_read_limit(
     assert decoded_chunk_sizes == [1]
 
 
+def test_eof_ambiguity_prefers_utf8_for_read_and_continuation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    prefix = b"a" * 4_096
+    utf8_character = b"\xc2\xa2"
+    (root / "eof-ambiguous.txt").write_bytes(
+        prefix + utf8_character
+    )
+    tools = _tools(root, max_read_bytes=5_000)
+
+    complete = tools.read_file(
+        "eof-ambiguous.txt",
+        limit=len(prefix) + len(utf8_character),
+    )
+    first = tools.read_file(
+        "eof-ambiguous.txt",
+        limit=len(prefix),
+    )
+    resumed = tools.read_file(
+        "eof-ambiguous.txt",
+        offset=first.data["next_offset"],
+        limit=len(utf8_character),
+        cursor=first.data["next_cursor"],
+    )
+
+    assert complete.ok
+    assert complete.data["content"] == ("a" * 4_096) + "\u00a2"
+    assert complete.data["encoding"] == "utf-8-sig"
+    assert complete.data["has_more"] is False
+    assert resumed.ok
+    assert resumed.data["content"] == "\u00a2"
+    assert resumed.data["encoding"] == "utf-8-sig"
+    assert resumed.data["has_more"] is False
+
+
+def test_eof_ambiguity_prefers_utf8_for_search(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "eof-ambiguous.txt").write_bytes(
+        (b"a" * 4_096) + b"\xc2\xa2"
+    )
+
+    result = _tools(root).search_files("\u00a2")
+
+    assert result.ok
+    assert result.data["matches"] == [
+        {
+            "path": "eof-ambiguous.txt",
+            "line": 1,
+            "snippet": ("a" * 100) + "\u00a2",
+        }
+    ]
+    assert result.data["warnings"] == []
+
+
 @pytest.mark.parametrize(
     "payload",
     [
