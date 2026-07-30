@@ -85,6 +85,34 @@ def test_workspace_guard_rejects_symlink_component(tmp_path: Path) -> None:
         guard.resolve("linked/secret.txt", must_exist=True)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point test")
+def test_workspace_guard_rejects_junction_component(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    junction = root / "junction"
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(outside)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if created.returncode != 0:
+        failure = (created.stderr or created.stdout).strip()
+        pytest.skip(
+            "directory junction creation failed "
+            f"with exit code {created.returncode}: {failure}"
+        )
+
+    try:
+        with pytest.raises(PathRejected):
+            WorkspaceGuard(root).resolve("junction/secret.txt")
+    finally:
+        os.rmdir(junction)
+
+
 def test_workspace_guard_rejects_symlink_root(tmp_path: Path) -> None:
     target = tmp_path / "real-workspace"
     target.mkdir()
