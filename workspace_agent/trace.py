@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -5,10 +7,14 @@ import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, IO
 
 
-_RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9-]+", flags=re.ASCII)
+MAX_RUN_ID_LENGTH = 64
+_RUN_ID_PATTERN = re.compile(
+    rf"[A-Za-z0-9-]{{1,{MAX_RUN_ID_LENGTH}}}",
+    flags=re.ASCII,
+)
 
 
 def sanitize_args(tool: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -22,9 +28,19 @@ def sanitize_args(tool: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 class TraceWriter:
-    def __init__(self, path: Path, lock: threading.Lock) -> None:
+    def __init__(
+        self,
+        path: Path,
+        lock: threading.Lock,
+        handle: IO[str] | None = None,
+    ) -> None:
         self.path = path
         self._lock = lock
+        self._handle = handle or path.open(
+            "a",
+            encoding="utf-8",
+            newline="\n",
+        )
 
     def append(
         self,
@@ -47,11 +63,33 @@ class TraceWriter:
             record,
             ensure_ascii=False,
             separators=(",", ":"),
+            allow_nan=False,
         )
         with self._lock:
-            with self.path.open("a", encoding="utf-8", newline="\n") as trace:
-                trace.write(line)
-                trace.write("\n")
+            if self._handle.closed:
+                raise ValueError("trace writer is closed")
+            self._handle.write(line)
+            self._handle.write("\n")
+            self._handle.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._handle.closed:
+                self._handle.close()
+
+    def __enter__(self) -> TraceWriter:
+        with self._lock:
+            if self._handle.closed:
+                raise ValueError("trace writer is closed")
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_value: object,
+        traceback: object,
+    ) -> None:
+        self.close()
 
 
 class TraceStore:
@@ -60,6 +98,7 @@ class TraceStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def path_for(self, run_id: str) -> Path:
+        """Return the JSONL path for a 1-64 character ASCII run ID."""
         if not isinstance(run_id, str) or not _RUN_ID_PATTERN.fullmatch(
             run_id
         ):
@@ -68,5 +107,5 @@ class TraceStore:
 
     def create(self, run_id: str) -> TraceWriter:
         path = self.path_for(run_id)
-        path.touch(exist_ok=False)
-        return TraceWriter(path, threading.Lock())
+        handle = path.open("x", encoding="utf-8", newline="\n")
+        return TraceWriter(path, threading.Lock(), handle)

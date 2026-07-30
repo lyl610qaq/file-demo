@@ -16,20 +16,32 @@ def _is_link_or_reparse(path: Path) -> bool:
     )
 
 
+def _reject_nonphysical_components(path: Path) -> None:
+    current = Path(path.anchor)
+    parts = path.parts[1:] if path.anchor else path.parts
+
+    if os.path.lexists(current) and _is_link_or_reparse(current):
+        raise PathRejected("workspace root has a non-physical ancestor")
+
+    for part in parts:
+        current = current / part
+        if not os.path.lexists(current):
+            break
+        if _is_link_or_reparse(current):
+            raise PathRejected("workspace root has a non-physical ancestor")
+
+
 class WorkspaceGuard:
     def __init__(self, root: str | os.PathLike[str]) -> None:
         expanded = Path(root).expanduser()
         absolute = Path(os.path.abspath(expanded))
 
-        if os.path.lexists(absolute) and _is_link_or_reparse(absolute):
-            raise PathRejected("workspace root is not a physical directory")
-
+        _reject_nonphysical_components(absolute)
         absolute.mkdir(parents=True, exist_ok=True)
-
-        if _is_link_or_reparse(absolute):
-            raise PathRejected("workspace root is not a physical directory")
-
-        self.root = Path(os.path.realpath(absolute))
+        canonical = Path(os.path.realpath(absolute))
+        _reject_nonphysical_components(absolute)
+        _reject_nonphysical_components(canonical)
+        self.root = canonical
 
     def resolve(self, relative: str, must_exist: bool = False) -> Path:
         if not isinstance(relative, str) or not relative:
