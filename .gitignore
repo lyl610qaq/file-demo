@@ -1,0 +1,20 @@
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+
+# Generated application data
+workspace/
+traces/
+
+# Browser test artifacts
+playwright-report/
+test-results/
