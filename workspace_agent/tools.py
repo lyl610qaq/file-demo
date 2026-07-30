@@ -1,12 +1,11 @@
 import codecs
 import hashlib
-import heapq
 import os
 import stat
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from workspace_agent.safety import PathRejected, WorkspaceGuard
 from workspace_agent.schemas import ToolResult
@@ -17,16 +16,37 @@ _HASH_CHUNK_BYTES = 65536
 _MAX_WARNINGS = 100
 _MAX_WARNING_CHARS = 500
 _MAX_SNIPPET_CHARS = 500
+_SEARCH_SEGMENT_CHARS = 4096
+_MAX_CHARACTER_PROBE_BYTES = 8
 
 
 class ToolInputError(ValueError):
-    def __init__(self, message: str, code: str = "INVALID_INPUT") -> None:
+    def __init__(
+        self,
+        message: str,
+        code: str = "INVALID_INPUT",
+        data: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.data = data or {}
 
 
-def _detect_encoding(path: Path) -> str:
-    with path.open("rb") as handle:
+def _detect_encoding(
+    path: Path,
+    *,
+    revalidate: Callable[[], Path] | None = None,
+) -> str:
+    if revalidate is None:
+        absolute = Path(os.path.abspath(path))
+        local_guard = WorkspaceGuard(absolute.parent)
+        revalidate = lambda: local_guard.resolve(
+            absolute.name,
+            must_exist=True,
+        )
+
+    sample_path = revalidate()
+    with sample_path.open("rb") as handle:
         sample = handle.read(_DETECTION_BYTES)
 
     has_utf16_bom = sample.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE))
@@ -38,7 +58,9 @@ def _detect_encoding(path: Path) -> str:
     else:
         candidates = ("utf-8-sig", "gb18030")
 
-    final = path.stat().st_size <= len(sample)
+    size_path = revalidate()
+    size = os.lstat(size_path).st_size
+    final = size <= len(sample)
     for encoding in candidates:
         decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
         try:
@@ -58,8 +80,7 @@ def _relative(root: Path, path: Path) -> str:
     return relative or "."
 
 
-def _is_link_or_reparse(path: Path) -> bool:
-    metadata = os.lstat(path)
+def _is_link_or_reparse(metadata: os.stat_result) -> bool:
     file_attributes = getattr(metadata, "st_file_attributes", 0)
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     return stat.S_ISLNK(metadata.st_mode) or bool(
@@ -119,10 +140,14 @@ def _success(data: dict[str, Any], summary: str) -> ToolResult:
     return ToolResult(ok=True, data=data, summary=summary[:500])
 
 
-def _failure(code: str, summary: str) -> ToolResult:
+def _failure(
+    code: str,
+    summary: str,
+    data: dict[str, Any] | None = None,
+) -> ToolResult:
     return ToolResult(
         ok=False,
-        data={},
+        data=data or {},
         summary=summary[:500],
         error_code=code,
     )
@@ -130,7 +155,11 @@ def _failure(code: str, summary: str) -> ToolResult:
 
 def _error_result(operation: str, error: Exception) -> ToolResult:
     if isinstance(error, ToolInputError):
-        return _failure(error.code, f"{operation} failed: {error}")
+        return _failure(
+            error.code,
+            f"{operation} failed: {error}",
+            error.data,
+        )
     if isinstance(error, PathRejected):
         return _failure("PATH_REJECTED", f"{operation} failed: path rejected")
     if isinstance(error, FileNotFoundError):
@@ -195,9 +224,8 @@ class WorkspaceTools:
             if not isinstance(recursive, bool):
                 raise ToolInputError("recursive must be a boolean")
 
-            resolved = self.guard.resolve(path, must_exist=True)
-            metadata = os.lstat(resolved)
-            if _is_link_or_reparse(resolved):
+            resolved, metadata = self._lstat(path)
+            if _is_link_or_reparse(metadata):
                 raise PathRejected("path contains a non-physical component")
             if not stat.S_ISDIR(metadata.st_mode):
                 raise ToolInputError(
@@ -246,9 +274,8 @@ class WorkspaceTools:
                 maximum=100,
             )
 
-            resolved = self.guard.resolve(path, must_exist=True)
-            metadata = os.lstat(resolved)
-            if _is_link_or_reparse(resolved):
+            resolved, metadata = self._lstat(path)
+            if _is_link_or_reparse(metadata):
                 raise PathRejected("path contains a non-physical component")
 
             warnings: list[str] = []
@@ -319,8 +346,15 @@ class WorkspaceTools:
                 maximum=self.max_read_bytes,
             )
 
+            resolved, _ = self._resolve_regular_file(path)
+            encoding = _detect_encoding(
+                resolved,
+                revalidate=lambda: self.guard.resolve(
+                    path,
+                    must_exist=True,
+                ),
+            )
             resolved, metadata = self._resolve_regular_file(path)
-            encoding = _detect_encoding(resolved)
             size = metadata.st_size
             if byte_offset > size or not self._is_character_boundary(
                 path,
@@ -332,15 +366,13 @@ class WorkspaceTools:
                     "INVALID_OFFSET",
                 )
 
-            resolved, metadata = self._resolve_regular_file(path)
-            with resolved.open("rb") as handle:
+            _, handle = self._open_file(path, "rb")
+            with handle:
                 handle.seek(byte_offset)
                 chunk = handle.read(min(byte_limit, metadata.st_size - byte_offset))
 
-            if encoding == "utf-16" and byte_offset:
-                resolved, _ = self._resolve_regular_file(path)
             decoder_encoding = self._decoder_encoding(
-                resolved,
+                path,
                 encoding,
                 byte_offset,
             )
@@ -357,6 +389,22 @@ class WorkspaceTools:
 
             next_offset = byte_offset + consumed
             has_more = next_offset < metadata.st_size
+            if consumed == 0 and has_more:
+                minimum_bytes = self._minimum_character_bytes(
+                    path,
+                    byte_offset,
+                    encoding,
+                )
+                data = (
+                    {"minimum_bytes": minimum_bytes}
+                    if minimum_bytes is not None
+                    else {}
+                )
+                raise ToolInputError(
+                    "limit does not contain the next complete character",
+                    "LIMIT_SPLITS_CHARACTER",
+                    data,
+                )
             relative_path = _relative(self.guard.root, resolved)
             return _success(
                 {
@@ -374,9 +422,8 @@ class WorkspaceTools:
 
     def stat_path(self, path: str) -> ToolResult:
         try:
-            resolved = self.guard.resolve(path, must_exist=True)
-            metadata = os.lstat(resolved)
-            if _is_link_or_reparse(resolved):
+            resolved, metadata = self._lstat(path)
+            if _is_link_or_reparse(metadata):
                 raise PathRejected("path contains a non-physical component")
 
             kind = _path_type(metadata)
@@ -384,7 +431,8 @@ class WorkspaceTools:
             if kind == "file":
                 resolved, metadata = self._resolve_regular_file(path)
                 hasher = hashlib.sha256()
-                with resolved.open("rb") as handle:
+                _, handle = self._open_file(path, "rb")
+                with handle:
                     for chunk in iter(
                         lambda: handle.read(_HASH_CHUNK_BYTES),
                         b"",
@@ -410,9 +458,8 @@ class WorkspaceTools:
         self,
         relative_path: str,
     ) -> tuple[Path, os.stat_result]:
-        resolved = self.guard.resolve(relative_path, must_exist=True)
-        metadata = os.lstat(resolved)
-        if _is_link_or_reparse(resolved):
+        resolved, metadata = self._lstat(relative_path)
+        if _is_link_or_reparse(metadata):
             raise PathRejected("path contains a non-physical component")
         if not stat.S_ISREG(metadata.st_mode):
             raise ToolInputError(
@@ -421,6 +468,22 @@ class WorkspaceTools:
             )
         return resolved, metadata
 
+    def _lstat(
+        self,
+        relative_path: str,
+    ) -> tuple[Path, os.stat_result]:
+        resolved = self.guard.resolve(relative_path, must_exist=True)
+        return resolved, os.lstat(resolved)
+
+    def _open_file(self, relative_path: str, mode: str, **kwargs):
+        resolved = self.guard.resolve(relative_path, must_exist=True)
+        return resolved, resolved.open(mode, **kwargs)
+
+    def _scan_names(self, relative_path: str) -> list[str]:
+        resolved = self.guard.resolve(relative_path, must_exist=True)
+        with os.scandir(resolved) as scan:
+            return sorted(entry.name for entry in scan)
+
     def _iter_entries(
         self,
         directory: str,
@@ -428,29 +491,17 @@ class WorkspaceTools:
         recursive: bool,
         warnings: list[str],
     ) -> Iterator[dict[str, Any]]:
-        resolved = self.guard.resolve(directory, must_exist=True)
-        metadata = os.lstat(resolved)
-        if _is_link_or_reparse(resolved) or not stat.S_ISDIR(metadata.st_mode):
+        _, metadata = self._lstat(directory)
+        if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
             return
 
-        with os.scandir(resolved) as scan:
-            names = sorted(entry.name for entry in scan)
-
-        for name in names:
+        for name in self._scan_names(directory):
             relative_path = (
                 name if directory == "." else f"{directory.rstrip('/')}/{name}"
             )
             try:
-                child = self.guard.root / Path(relative_path)
-                if _is_link_or_reparse(child):
-                    _warning(
-                        warnings,
-                        f"Skipped unsafe entry: {relative_path}",
-                    )
-                    continue
-                child = self.guard.resolve(relative_path, must_exist=True)
-                child_metadata = os.lstat(child)
-                if _is_link_or_reparse(child):
+                child, child_metadata = self._lstat(relative_path)
+                if _is_link_or_reparse(child_metadata):
                     _warning(
                         warnings,
                         f"Skipped unsafe entry: {relative_path}",
@@ -482,30 +533,17 @@ class WorkspaceTools:
         directory: str,
         warnings: list[str],
     ) -> Iterator[str]:
-        resolved = self.guard.resolve(directory, must_exist=True)
-        metadata = os.lstat(resolved)
-        if _is_link_or_reparse(resolved) or not stat.S_ISDIR(metadata.st_mode):
+        _, metadata = self._lstat(directory)
+        if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
             return
 
-        with os.scandir(resolved) as scan:
-            names = sorted(entry.name for entry in scan)
-
-        iterators: list[Iterator[str]] = []
-        for name in names:
+        for name in self._scan_names(directory):
             relative_path = (
                 name if directory == "." else f"{directory.rstrip('/')}/{name}"
             )
             try:
-                child = self.guard.root / Path(relative_path)
-                if _is_link_or_reparse(child):
-                    _warning(
-                        warnings,
-                        f"Skipped unsafe entry: {relative_path}",
-                    )
-                    continue
-                child = self.guard.resolve(relative_path, must_exist=True)
-                child_metadata = os.lstat(child)
-                if _is_link_or_reparse(child):
+                _, child_metadata = self._lstat(relative_path)
+                if _is_link_or_reparse(child_metadata):
                     _warning(
                         warnings,
                         f"Skipped unsafe entry: {relative_path}",
@@ -520,11 +558,9 @@ class WorkspaceTools:
 
             kind = _path_type(child_metadata)
             if kind == "file":
-                iterators.append(iter((relative_path,)))
+                yield relative_path
             elif kind == "directory":
-                iterators.append(self._iter_files(relative_path, warnings))
-
-        yield from heapq.merge(*iterators)
+                yield from self._iter_files(relative_path, warnings)
 
     def _iter_matches(
         self,
@@ -536,24 +572,31 @@ class WorkspaceTools:
         for relative_path in files:
             try:
                 resolved, _ = self._resolve_regular_file(relative_path)
-                encoding = _detect_encoding(resolved)
-                resolved, _ = self._resolve_regular_file(relative_path)
-                with resolved.open(
+                encoding = _detect_encoding(
+                    resolved,
+                    revalidate=lambda: self.guard.resolve(
+                        relative_path,
+                        must_exist=True,
+                    ),
+                )
+                _, handle = self._open_file(
+                    relative_path,
                     "r",
                     encoding=encoding,
                     errors="strict",
                     newline=None,
-                ) as handle:
-                    for line_number, line in enumerate(handle, start=1):
-                        haystack = line if case_sensitive else line.casefold()
-                        if needle in haystack:
-                            yield {
-                                "path": relative_path,
-                                "line": line_number,
-                                "snippet": line.rstrip("\r\n")[
-                                    :_MAX_SNIPPET_CHARS
-                                ],
-                            }
+                )
+                with handle:
+                    for line_number, snippet in self._bounded_line_matches(
+                        handle,
+                        needle,
+                        case_sensitive,
+                    ):
+                        yield {
+                            "path": relative_path,
+                            "line": line_number,
+                            "snippet": snippet,
+                        }
             except ToolInputError as error:
                 _warning(
                     warnings,
@@ -570,6 +613,41 @@ class WorkspaceTools:
                     f"Skipped {relative_path}: file could not be read safely",
                 )
 
+    @staticmethod
+    def _bounded_line_matches(
+        handle,
+        needle: str,
+        case_sensitive: bool,
+    ) -> Iterator[tuple[int, str]]:
+        line_number = 1
+        carry = ""
+        snippet = ""
+        matched = False
+        carry_size = max(len(needle) - 1, 0)
+
+        while True:
+            segment = handle.readline(_SEARCH_SEGMENT_CHARS)
+            if segment == "":
+                return
+
+            if len(snippet) < _MAX_SNIPPET_CHARS:
+                remaining = _MAX_SNIPPET_CHARS - len(snippet)
+                snippet += segment[:remaining]
+
+            searchable = segment if case_sensitive else segment.casefold()
+            combined = carry + searchable
+            if not matched and needle in combined:
+                yield line_number, snippet.rstrip("\r\n")
+                matched = True
+
+            if segment.endswith("\n"):
+                line_number += 1
+                carry = ""
+                snippet = ""
+                matched = False
+            elif carry_size:
+                carry = combined[-carry_size:]
+
     def _is_character_boundary(
         self,
         relative_path: str,
@@ -579,13 +657,14 @@ class WorkspaceTools:
         if offset == 0:
             return True
 
-        resolved, metadata = self._resolve_regular_file(relative_path)
+        _, metadata = self._resolve_regular_file(relative_path)
         if offset > metadata.st_size:
             return False
 
         decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
         remaining = offset
-        with resolved.open("rb") as handle:
+        _, handle = self._open_file(relative_path, "rb")
+        with handle:
             while remaining:
                 chunk = handle.read(min(_HASH_CHUNK_BYTES, remaining))
                 if not chunk:
@@ -595,9 +674,9 @@ class WorkspaceTools:
         buffered, _ = decoder.getstate()
         return not buffered
 
-    @staticmethod
     def _decoder_encoding(
-        path: Path,
+        self,
+        relative_path: str,
         encoding: str,
         offset: int,
     ) -> str:
@@ -606,7 +685,32 @@ class WorkspaceTools:
         if encoding == "utf-8-sig":
             return "utf-8"
         if encoding == "utf-16":
-            with path.open("rb") as handle:
+            _, handle = self._open_file(relative_path, "rb")
+            with handle:
                 bom = handle.read(2)
             return "utf-16-le" if bom == codecs.BOM_UTF16_LE else "utf-16-be"
         return encoding
+
+    def _minimum_character_bytes(
+        self,
+        relative_path: str,
+        offset: int,
+        encoding: str,
+    ) -> int | None:
+        decoder_encoding = self._decoder_encoding(
+            relative_path,
+            encoding,
+            offset,
+        )
+        _, handle = self._open_file(relative_path, "rb")
+        with handle:
+            handle.seek(offset)
+            probe = handle.read(_MAX_CHARACTER_PROBE_BYTES)
+
+        decoder = codecs.getincrementaldecoder(decoder_encoding)(
+            errors="strict"
+        )
+        for byte_count, byte in enumerate(probe, start=1):
+            if decoder.decode(bytes((byte,)), final=False):
+                return byte_count
+        return None

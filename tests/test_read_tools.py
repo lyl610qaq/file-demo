@@ -220,6 +220,86 @@ def test_search_files_streams_to_a_large_file_tail(tmp_path: Path) -> None:
     assert len(repr(result.data)) < 1_000
 
 
+def test_search_files_uses_sorted_depth_first_file_order(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    (root / "a").mkdir(parents=True)
+    (root / "a" / "nested.txt").write_text("hit", encoding="utf-8")
+    (root / "a.txt").write_text("hit", encoding="utf-8")
+    (root / "b.txt").write_text("hit", encoding="utf-8")
+
+    result = _tools(root).search_files("hit")
+
+    assert result.ok
+    assert [match["path"] for match in result.data["matches"]] == [
+        "a/nested.txt",
+        "a.txt",
+        "b.txt",
+    ]
+
+
+def test_search_files_bounds_multi_megabyte_logical_lines_and_carry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    segment_size = 4096
+    query = "boundary"
+    prefix = "x" * (segment_size - 3)
+    (root / "huge.txt").write_text(
+        prefix + query + ("y" * (3 * 1024 * 1024)),
+        encoding="utf-8",
+    )
+    tools_module = _tools_module()
+    original_open_file = tools_module.WorkspaceTools._open_file
+    readline_sizes: list[int] = []
+
+    class BoundedTextReader:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def __iter__(self):
+            raise AssertionError("logical lines must not use unbounded iteration")
+
+        def readline(self, size: int = -1) -> str:
+            assert 0 < size <= segment_size
+            readline_sizes.append(size)
+            return self.handle.readline(size)
+
+    def bounded_open_file(self, relative_path: str, mode: str, **kwargs):
+        resolved, handle = original_open_file(
+            self,
+            relative_path,
+            mode,
+            **kwargs,
+        )
+        if relative_path == "huge.txt" and mode == "r":
+            handle = BoundedTextReader(handle)
+        return resolved, handle
+
+    monkeypatch.setattr(
+        tools_module.WorkspaceTools,
+        "_open_file",
+        bounded_open_file,
+    )
+
+    result = _tools(root).search_files(query)
+
+    assert result.ok
+    assert result.data["matches"][0]["path"] == "huge.txt"
+    assert result.data["matches"][0]["line"] == 1
+    assert len(result.data["matches"][0]["snippet"]) <= 500
+    assert readline_sizes
+
+
 def test_read_file_continues_on_utf8_character_boundaries(
     tmp_path: Path,
 ) -> None:
@@ -256,6 +336,32 @@ def test_read_file_rejects_mid_character_offset_and_excessive_limit(
     assert invalid_offset.error_code == "INVALID_OFFSET"
     assert excessive_limit.ok is False
     assert excessive_limit.error_code == "INVALID_LIMIT"
+
+
+@pytest.mark.parametrize(
+    ("name", "encoding", "content", "minimum_bytes"),
+    [
+        ("utf8.txt", "utf-8", "你", 3),
+        ("gb.txt", "gb18030", "中", 2),
+    ],
+)
+def test_read_file_fails_when_limit_cannot_make_character_progress(
+    tmp_path: Path,
+    name: str,
+    encoding: str,
+    content: str,
+    minimum_bytes: int,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / name).write_bytes(content.encode(encoding))
+
+    result = _tools(root, max_read_bytes=8).read_file(name, limit=1)
+
+    assert result.ok is False
+    assert result.error_code == "LIMIT_SPLITS_CHARACTER"
+    assert result.data == {"minimum_bytes": minimum_bytes}
+    assert "next_offset" not in result.data
 
 
 @pytest.mark.parametrize(
@@ -322,39 +428,90 @@ def test_encoding_detection_never_uses_path_read_bytes(
     assert _tools(root).read_file("note.txt").data["content"] == "hello"
 
 
-def test_read_file_revalidates_immediately_before_every_open(
+def test_tools_revalidate_same_relative_path_before_every_filesystem_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "workspace"
-    root.mkdir()
-    target = root / "utf16.txt"
-    target.write_bytes("hello".encode("utf-16"))
-    events: list[str] = []
+    (root / "nested").mkdir(parents=True)
+    target = root / "nested" / "note.txt"
+    target.write_text("hello target", encoding="utf-8")
+    events: list[tuple[str, str]] = []
 
     class RecordingGuard(WorkspaceGuard):
-        def resolve(self, relative: str, must_exist: bool = False) -> Path:
-            events.append("resolve")
-            return super().resolve(relative, must_exist=must_exist)
+        resolving = False
+        pending: str | None = None
 
+        def resolve(self, relative: str, must_exist: bool = False) -> Path:
+            self.resolving = True
+            try:
+                resolved = super().resolve(relative, must_exist=must_exist)
+            finally:
+                self.resolving = False
+            self.pending = resolved.relative_to(self.root).as_posix() or "."
+            return resolved
+
+    guard = RecordingGuard(root)
+    tools_module = _tools_module()
+    original_lstat = os.lstat
+    original_scandir = os.scandir
     original_open = Path.open
+    original_stat = Path.stat
+
+    def relative_path(path) -> str | None:
+        try:
+            relative = Path(os.path.abspath(path)).relative_to(root)
+        except ValueError:
+            return None
+        return relative.as_posix() or "."
+
+    def record_access(kind: str, path) -> None:
+        relative = relative_path(path)
+        if relative is None or guard.resolving:
+            return
+        assert guard.pending == relative, (
+            f"{kind} for {relative} was not immediately preceded by "
+            "a same-path guard resolution"
+        )
+        events.append((kind, relative))
+        guard.pending = None
+
+    def recording_lstat(path, *args, **kwargs):
+        record_access("lstat", path)
+        return original_lstat(path, *args, **kwargs)
+
+    def recording_scandir(path):
+        record_access("scandir", path)
+        return original_scandir(path)
 
     def recording_open(self: Path, *args, **kwargs):
-        if self == target:
-            assert events[-1] == "resolve"
-            events.append("open")
+        record_access("open", self)
         return original_open(self, *args, **kwargs)
 
+    def recording_stat(self: Path, *args, **kwargs):
+        record_access("stat", self)
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(tools_module.os, "lstat", recording_lstat)
+    monkeypatch.setattr(tools_module.os, "scandir", recording_scandir)
     monkeypatch.setattr(Path, "open", recording_open)
-    tools = _tools_module().WorkspaceTools(
-        RecordingGuard(root),
+    monkeypatch.setattr(Path, "stat", recording_stat)
+    tools = tools_module.WorkspaceTools(
+        guard,
         max_read_bytes=16,
         max_write_bytes=16,
     )
 
-    result = tools.read_file("utf16.txt", offset=2, limit=2)
+    listed = tools.list_dir(recursive=True)
+    searched = tools.search_files("target")
+    read = tools.read_file("nested/note.txt", limit=8)
+    inspected = tools.stat_path("nested/note.txt")
 
-    assert result.ok
+    assert listed.ok
+    assert searched.ok
+    assert read.ok
+    assert inspected.ok
+    assert {"lstat", "scandir", "open"} <= {kind for kind, _ in events}
 
 
 def test_stat_path_hashes_files_and_never_leaks_absolute_root(
