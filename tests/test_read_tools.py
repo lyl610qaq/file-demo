@@ -368,9 +368,9 @@ def test_search_files_bounds_multi_megabyte_logical_lines_and_carry(
     )
     tools_module = _tools_module()
     original_open_file = tools_module.WorkspaceTools._open_file
-    readline_sizes: list[int] = []
+    read_sizes: list[int] = []
 
-    class BoundedTextReader:
+    class BoundedBinaryReader:
         def __init__(self, handle) -> None:
             self.handle = handle
 
@@ -380,13 +380,13 @@ def test_search_files_bounds_multi_megabyte_logical_lines_and_carry(
         def __exit__(self, *args):
             return self.handle.__exit__(*args)
 
-        def __iter__(self):
-            raise AssertionError("logical lines must not use unbounded iteration")
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
 
-        def readline(self, size: int = -1) -> str:
+        def read(self, size: int = -1) -> bytes:
             assert 0 < size <= segment_size
-            readline_sizes.append(size)
-            return self.handle.readline(size)
+            read_sizes.append(size)
+            return self.handle.read(size)
 
     def bounded_open_file(self, relative_path: str, mode: str, **kwargs):
         resolved, handle = original_open_file(
@@ -395,8 +395,8 @@ def test_search_files_bounds_multi_megabyte_logical_lines_and_carry(
             mode,
             **kwargs,
         )
-        if relative_path == "huge.txt" and mode == "r":
-            handle = BoundedTextReader(handle)
+        if relative_path == "huge.txt" and mode == "rb":
+            handle = BoundedBinaryReader(handle)
         return resolved, handle
 
     monkeypatch.setattr(
@@ -411,7 +411,71 @@ def test_search_files_bounds_multi_megabyte_logical_lines_and_carry(
     assert result.data["matches"][0]["path"] == "huge.txt"
     assert result.data["matches"][0]["line"] == 1
     assert len(result.data["matches"][0]["snippet"]) <= 500
-    assert readline_sizes
+    assert read_sizes
+
+
+def test_ambiguous_search_stops_after_page_and_resumes_without_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "large.txt"
+    target.write_bytes(
+        b"hit one\nhit two\n" + (b"x" * (8 * 1024 * 1024))
+    )
+    tools = _tools(root)
+    original_open_file = tools._open_file
+    bytes_read = 0
+
+    class CountingReader:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+        def read(self, size: int = -1):
+            nonlocal bytes_read
+            data = self.handle.read(size)
+            bytes_read += len(data)
+            return data
+
+        def readline(self, size: int = -1):
+            nonlocal bytes_read
+            data = self.handle.readline(size)
+            bytes_read += len(data)
+            return data
+
+    def counting_open_file(relative_path: str, mode: str, **kwargs):
+        resolved, handle = original_open_file(relative_path, mode, **kwargs)
+        if relative_path == "large.txt":
+            handle = CountingReader(handle)
+        return resolved, handle
+
+    monkeypatch.setattr(tools, "_open_file", counting_open_file)
+
+    first = tools.search_files("hit", limit=1)
+    first_page_bytes = bytes_read
+    second = tools.search_files(
+        "hit",
+        limit=1,
+        cursor=first.data["next_cursor"],
+    )
+
+    assert first.ok
+    assert first.data["matches"][0]["line"] == 1
+    assert first.data["has_more"] is True
+    assert first_page_bytes < 64 * 1024
+    assert second.ok
+    assert second.data["matches"][0]["line"] == 2
+    assert second.data["has_more"] is False
 
 
 def test_late_huge_line_match_is_in_bounded_snippet(tmp_path: Path) -> None:
@@ -428,6 +492,49 @@ def test_late_huge_line_match_is_in_bounded_snippet(tmp_path: Path) -> None:
     snippet = result.data["matches"][0]["snippet"]
     assert len(snippet) <= 500
     assert query in snippet
+
+
+def test_casefold_snippet_uses_original_source_indexes(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    original_match = "NeEdLe"
+    (root / "folded.txt").write_text(
+        ("\u00df" * 300) + original_match + "\n",
+        encoding="utf-8",
+    )
+
+    result = _tools(root).search_files(
+        "needle",
+        case_sensitive=False,
+    )
+
+    assert result.ok
+    snippet = result.data["matches"][0]["snippet"]
+    assert snippet
+    assert len(snippet) <= 500
+    assert original_match in snippet
+
+
+def test_late_binary_nul_fails_read_and_warns_search(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "late-binary.txt").write_bytes(
+        (b"a" * 5_001) + b"\x00hidden match\n"
+    )
+    tools = _tools(root)
+
+    read = tools.read_file("late-binary.txt")
+    searched = tools.search_files("hidden")
+
+    assert read.ok is False
+    assert read.error_code == "BINARY_FILE"
+    assert searched.ok
+    assert searched.data["matches"] == []
+    assert any(
+        "late-binary.txt" in warning
+        and "binary" in warning.lower()
+        for warning in searched.data["warnings"]
+    )
 
 
 def test_nested_scan_errors_warn_and_preserve_readable_siblings(
@@ -713,6 +820,83 @@ def test_ascii_probe_then_gb18030_content_reads_and_searches(
         ("late-gb.txt", 1)
     ]
     assert direct_offset.error_code == "OFFSET_REQUIRES_CURSOR"
+
+
+def test_ambiguous_gb18030_split_keeps_both_candidates_in_cursor(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    prefix = b"a" * 5_000
+    encoded_character = "\u4e2d".encode("gb18030")
+    (root / "split-gb.txt").write_bytes(
+        prefix + encoded_character + b"\n"
+    )
+    tools = _tools(root, max_read_bytes=6_000)
+
+    first = tools.read_file("split-gb.txt", limit=len(prefix) + 1)
+    tools_module = _tools_module()
+    cursor_payload = tools_module._decode_cursor(
+        first.data["next_cursor"],
+        tools._cursor_key,
+    )
+    second = tools.read_file(
+        "split-gb.txt",
+        offset=first.data["next_offset"],
+        limit=len(encoded_character),
+        cursor=first.data["next_cursor"],
+    )
+
+    assert first.ok
+    assert first.data["content"] == prefix.decode("ascii")
+    assert first.data["next_offset"] == len(prefix)
+    assert first.data["encoding"] == "utf-8-or-gb18030"
+    assert isinstance(first.data["next_cursor"], str)
+    assert cursor_payload["candidates"] == ["utf-8-sig", "gb18030"]
+    assert tools_module._base64_decode(cursor_payload["pending"]) == (
+        encoded_character[:1]
+    )
+    assert second.ok
+    assert second.data["content"] == "\u4e2d"
+    assert second.data["encoding"] == "gb18030"
+
+
+def test_ambiguous_cursor_pending_bytes_still_honor_read_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    prefix = b"a" * 5_000
+    ambiguous_pair = b"\xe4\xb8"
+    (root / "ambiguous.txt").write_bytes(
+        prefix + ambiguous_pair + b"\xad\n"
+    )
+    tools = _tools(root, max_read_bytes=6_000)
+    first = tools.read_file(
+        "ambiguous.txt",
+        limit=len(prefix) + len(ambiguous_pair),
+    )
+    original_decode = tools._decode_read_chunk
+    decoded_chunk_sizes: list[int] = []
+
+    def recording_decode(*args, **kwargs):
+        decoded_chunk_sizes.append(len(args[3]))
+        return original_decode(*args, **kwargs)
+
+    monkeypatch.setattr(tools, "_decode_read_chunk", recording_decode)
+    too_small = tools.read_file(
+        "ambiguous.txt",
+        offset=first.data["next_offset"],
+        limit=1,
+        cursor=first.data["next_cursor"],
+    )
+
+    assert first.ok
+    assert first.data["next_offset"] == len(prefix)
+    assert too_small.error_code == "LIMIT_SPLITS_CHARACTER"
+    assert too_small.data == {"minimum_bytes": 2}
+    assert decoded_chunk_sizes == [1]
 
 
 @pytest.mark.parametrize(

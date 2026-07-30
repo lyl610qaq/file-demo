@@ -23,6 +23,7 @@ _MAX_WARNING_CHARS = 500
 _MAX_SNIPPET_CHARS = 500
 _SEARCH_SEGMENT_CHARS = 4096
 _MAX_CHARACTER_PROBE_BYTES = 8
+_MAX_AMBIGUOUS_TEXT_CHARS = 8
 _CURSOR_VERSION = 1
 
 
@@ -195,6 +196,40 @@ def _bounded_int(
 def _warning(warnings: list[str], message: str) -> None:
     if len(warnings) < _MAX_WARNINGS:
         warnings.append(message[:_MAX_WARNING_CHARS])
+
+
+def _common_prefix(values: list[str]) -> str:
+    if not values:
+        return ""
+    prefix = values[0]
+    for value in values[1:]:
+        while not value.startswith(prefix):
+            prefix = prefix[:-1]
+            if not prefix:
+                return ""
+    return prefix
+
+
+def _match_span(
+    source: str,
+    needle: str,
+    case_sensitive: bool,
+) -> tuple[int, int] | None:
+    if case_sensitive:
+        start = source.find(needle)
+        return None if start < 0 else (start, start + len(needle))
+
+    folded_parts: list[str] = []
+    source_indexes: list[int] = []
+    for source_index, character in enumerate(source):
+        folded = character.casefold()
+        folded_parts.append(folded)
+        source_indexes.extend([source_index] * len(folded))
+    start = "".join(folded_parts).find(needle)
+    if start < 0:
+        return None
+    end = start + len(needle)
+    return source_indexes[start], source_indexes[end - 1] + 1
 
 
 def _success(data: dict[str, Any], summary: str) -> ToolResult:
@@ -547,6 +582,29 @@ class WorkspaceTools:
                         "STALE_CURSOR",
                     )
                 encoding = cursor_payload["encoding"]
+                if encoding == "utf-8-or-gb18030":
+                    raw_candidates = cursor_payload.get("candidates")
+                    if raw_candidates != ["utf-8-sig", "gb18030"]:
+                        raise ToolInputError(
+                            "cursor decoder state is invalid",
+                            "INVALID_CURSOR",
+                        )
+                    candidates = tuple(raw_candidates)
+                    raw_pending = cursor_payload.get("pending")
+                    if not isinstance(raw_pending, str):
+                        raise ToolInputError(
+                            "cursor decoder state is invalid",
+                            "INVALID_CURSOR",
+                        )
+                    pending_input = _base64_decode(raw_pending)
+                    if len(pending_input) > _MAX_CHARACTER_PROBE_BYTES:
+                        raise ToolInputError(
+                            "cursor decoder state is invalid",
+                            "INVALID_CURSOR",
+                        )
+                else:
+                    candidates = (encoding,)
+                    pending_input = b""
             else:
                 encoding = _detect_encoding(
                     resolved,
@@ -555,6 +613,8 @@ class WorkspaceTools:
                         must_exist=True,
                     ),
                 )
+                candidates = self._encoding_candidates(encoding)
+                pending_input = b""
 
             size = metadata.st_size
             if byte_offset > size:
@@ -595,14 +655,34 @@ class WorkspaceTools:
                         "OFFSET_REQUIRES_CURSOR",
                     )
 
+            if byte_offset + len(pending_input) > size:
+                raise ToolInputError(
+                    "cursor decoder state is invalid",
+                    "INVALID_CURSOR",
+                )
+            included_pending = pending_input[:byte_limit]
             _, handle = self._open_file(path, "rb")
             with handle:
-                handle.seek(byte_offset)
-                chunk = handle.read(min(byte_limit, metadata.st_size - byte_offset))
+                handle.seek(byte_offset + len(included_pending))
+                remaining_limit = byte_limit - len(included_pending)
+                chunk = included_pending + handle.read(
+                    min(
+                        remaining_limit,
+                        metadata.st_size
+                        - byte_offset
+                        - len(included_pending),
+                    )
+                )
+            self._reject_binary_chunk(chunk, encoding)
 
-            content, consumed, selected_encoding = self._decode_read_chunk(
+            (
+                content,
+                consumed,
+                selected_encoding,
+                surviving_candidates,
+            ) = self._decode_read_chunk(
                 path,
-                encoding,
+                candidates,
                 byte_offset,
                 chunk,
                 byte_offset + len(chunk) == metadata.st_size,
@@ -620,11 +700,21 @@ class WorkspaceTools:
 
             next_offset = byte_offset + consumed
             has_more = next_offset < metadata.st_size
+            next_pending = (
+                chunk[consumed:]
+                if selected_encoding == "utf-8-or-gb18030"
+                else b""
+            )
+            if len(next_pending) > _MAX_CHARACTER_PROBE_BYTES:
+                raise ToolInputError(
+                    "file charset remains ambiguous",
+                    "CHARSET_UNDETERMINED",
+                )
             if consumed == 0 and has_more:
                 minimum_bytes = self._minimum_character_bytes(
                     path,
                     byte_offset,
-                    selected_encoding,
+                    surviving_candidates,
                 )
                 data = (
                     {"minimum_bytes": minimum_bytes}
@@ -645,6 +735,14 @@ class WorkspaceTools:
                         "path": relative_path,
                         "offset": next_offset,
                         "encoding": selected_encoding,
+                        **(
+                            {
+                                "candidates": list(surviving_candidates),
+                                "pending": _base64_encode(next_pending),
+                            }
+                            if selected_encoding == "utf-8-or-gb18030"
+                            else {}
+                        ),
                         "size": metadata.st_size,
                         "mtime_ns": metadata.st_mtime_ns,
                     },
@@ -896,40 +994,27 @@ class WorkspaceTools:
                         must_exist=True,
                     ),
                 )
-                if encoding == "utf-8-or-gb18030":
-                    encoding = (
-                        "utf-8-sig"
-                        if self._stream_decodes(
-                            relative_path,
-                            "utf-8-sig",
-                        )
-                        else "gb18030"
-                    )
-                _, handle = self._open_file(
+                decoded_chunks = self._iter_decoded_chunks(
                     relative_path,
-                    "r",
-                    encoding=encoding,
-                    errors="strict",
-                    newline=None,
+                    encoding,
                 )
-                with handle:
-                    for line_number, snippet in self._bounded_line_matches(
-                        handle,
-                        needle,
-                        case_sensitive,
+                for line_number, snippet in self._bounded_line_matches(
+                    self._normalize_newlines(decoded_chunks),
+                    needle,
+                    case_sensitive,
+                ):
+                    if (
+                        relative_path == after_path
+                        and line_number <= after_line
                     ):
-                        if (
-                            relative_path == after_path
-                            and line_number <= after_line
-                        ):
-                            continue
-                        yield {
-                            "path": relative_path,
-                            "line": line_number,
-                            "snippet": snippet,
-                            "_size": metadata.st_size,
-                            "_mtime_ns": metadata.st_mtime_ns,
-                        }
+                        continue
+                    yield {
+                        "path": relative_path,
+                        "line": line_number,
+                        "snippet": snippet,
+                        "_size": metadata.st_size,
+                        "_mtime_ns": metadata.st_mtime_ns,
+                    }
             except ToolInputError as error:
                 _warning(
                     warnings,
@@ -946,72 +1031,133 @@ class WorkspaceTools:
                     f"Skipped {relative_path}: file could not be read safely",
                 )
 
-    def _stream_decodes(
+    def _iter_decoded_chunks(
         self,
         relative_path: str,
         encoding: str,
-    ) -> bool:
-        decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+    ) -> Iterator[str]:
+        candidates = self._encoding_candidates(encoding)
+        decoders = {
+            candidate: codecs.getincrementaldecoder(candidate)(
+                errors="strict"
+            )
+            for candidate in candidates
+        }
+        pending = {candidate: "" for candidate in candidates}
         _, handle = self._open_file(relative_path, "rb")
-        try:
-            with handle:
-                while True:
-                    chunk = handle.read(_SEARCH_SEGMENT_CHARS)
-                    if not chunk:
-                        decoder.decode(b"", final=True)
-                        return True
-                    decoder.decode(chunk, final=False)
-        except UnicodeDecodeError:
-            return False
+        with handle:
+            while True:
+                chunk = handle.read(_SEARCH_SEGMENT_CHARS)
+                final = not chunk
+                if chunk:
+                    self._reject_binary_chunk(chunk, encoding)
+
+                decoded: dict[str, str] = {}
+                last_error: UnicodeDecodeError | None = None
+                for candidate in tuple(decoders):
+                    try:
+                        decoded[candidate] = decoders[candidate].decode(
+                            chunk,
+                            final=final,
+                        )
+                    except UnicodeDecodeError as error:
+                        last_error = error
+                        del decoders[candidate]
+                        del pending[candidate]
+
+                if not decoders:
+                    assert last_error is not None
+                    raise last_error
+                if len(decoders) == 1:
+                    selected = next(iter(decoders))
+                    text = pending[selected] + decoded.get(selected, "")
+                    pending[selected] = ""
+                    if text:
+                        yield text
+                else:
+                    for candidate, text in decoded.items():
+                        pending[candidate] += text
+                    common = _common_prefix(list(pending.values()))
+                    if common:
+                        yield common
+                        for candidate in pending:
+                            pending[candidate] = pending[candidate][
+                                len(common):
+                            ]
+                    if any(
+                        len(text) > _MAX_AMBIGUOUS_TEXT_CHARS
+                        for text in pending.values()
+                    ):
+                        raise ToolInputError(
+                            "file charset remains ambiguous",
+                            "CHARSET_UNDETERMINED",
+                        )
+                if final:
+                    if len(decoders) > 1 and any(pending.values()):
+                        raise ToolInputError(
+                            "file charset remains ambiguous",
+                            "CHARSET_UNDETERMINED",
+                        )
+                    return
+
+    @staticmethod
+    def _normalize_newlines(chunks: Iterator[str]) -> Iterator[str]:
+        pending_carriage_return = False
+        for chunk in chunks:
+            if pending_carriage_return:
+                if chunk.startswith("\n"):
+                    chunk = chunk[1:]
+                chunk = "\n" + chunk
+                pending_carriage_return = False
+            if chunk.endswith("\r"):
+                chunk = chunk[:-1]
+                pending_carriage_return = True
+            normalized = chunk.replace("\r\n", "\n").replace("\r", "\n")
+            if normalized:
+                yield normalized
+        if pending_carriage_return:
+            yield "\n"
 
     @staticmethod
     def _bounded_line_matches(
-        handle,
+        chunks: Iterator[str],
         needle: str,
         case_sensitive: bool,
     ) -> Iterator[tuple[int, str]]:
         line_number = 1
-        carry = ""
         line_tail = ""
         matched = False
-        carry_size = max(len(needle) - 1, 0)
+        tail_size = max(_MAX_SNIPPET_CHARS, len(needle))
 
-        while True:
-            segment = handle.readline(_SEARCH_SEGMENT_CHARS)
-            if segment == "":
-                return
-
-            searchable = segment if case_sensitive else segment.casefold()
-            combined = carry + searchable
-            if not matched and needle in combined:
+        for chunk in chunks:
+            for segment in chunk.splitlines(keepends=True):
                 snippet_source = line_tail + segment
-                snippet_searchable = (
-                    snippet_source
-                    if case_sensitive
-                    else snippet_source.casefold()
-                )
-                match_index = snippet_searchable.find(needle)
-                if match_index < 0:
-                    match_index = max(
-                        0,
-                        len(snippet_source) - len(segment),
+                if not matched:
+                    span = _match_span(
+                        snippet_source,
+                        needle,
+                        case_sensitive,
                     )
-                start = max(0, match_index - 100)
-                snippet = snippet_source[
-                    start : start + _MAX_SNIPPET_CHARS
-                ].rstrip("\r\n")
-                yield line_number, snippet
-                matched = True
+                    if span is not None:
+                        match_start, match_end = span
+                        start = max(0, match_start - 100)
+                        if match_end - start > _MAX_SNIPPET_CHARS:
+                            start = max(
+                                0,
+                                match_end - _MAX_SNIPPET_CHARS,
+                            )
+                        snippet = snippet_source[
+                            start : start + _MAX_SNIPPET_CHARS
+                        ].rstrip("\n")
+                        yield line_number, snippet
+                        matched = True
 
-            if segment.endswith("\n"):
-                line_number += 1
-                carry = ""
-                line_tail = ""
-                matched = False
-            else:
-                line_tail = (line_tail + segment)[-_MAX_SNIPPET_CHARS:]
-                if carry_size:
-                    carry = combined[-carry_size:]
+                if segment.endswith("\n"):
+                    line_number += 1
+                    line_tail = ""
+                    matched = False
+                else:
+                    line_tail = snippet_source[-tail_size:]
 
     def _is_character_boundary(
         self,
@@ -1130,19 +1276,29 @@ class WorkspaceTools:
             return False
         return True
 
+    @staticmethod
+    def _encoding_candidates(encoding: str) -> tuple[str, ...]:
+        if encoding == "utf-8-or-gb18030":
+            return ("utf-8-sig", "gb18030")
+        return (encoding,)
+
+    @staticmethod
+    def _reject_binary_chunk(chunk: bytes, encoding: str) -> None:
+        if encoding != "utf-16" and b"\x00" in chunk:
+            raise ToolInputError(
+                "file appears to be binary",
+                "BINARY_FILE",
+            )
+
     def _decode_read_chunk(
         self,
         relative_path: str,
-        encoding: str,
+        candidates: tuple[str, ...],
         offset: int,
         chunk: bytes,
         reaches_eof: bool,
-    ) -> tuple[str, int, str]:
-        candidates = (
-            ("utf-8-sig", "gb18030")
-            if encoding == "utf-8-or-gb18030"
-            else (encoding,)
-        )
+    ) -> tuple[str, int, str, tuple[str, ...]]:
+        results: dict[str, tuple[str, int]] = {}
         last_error: UnicodeDecodeError | None = None
         for candidate in candidates:
             decoder_encoding = self._decoder_encoding(
@@ -1163,16 +1319,80 @@ class WorkspaceTools:
             except UnicodeDecodeError as error:
                 last_error = error
                 continue
-            selected = candidate
-            if (
-                encoding == "utf-8-or-gb18030"
-                and candidate == "utf-8-sig"
-                and chunk.isascii()
+            results[candidate] = (content, consumed)
+
+        if not results:
+            assert last_error is not None
+            raise last_error
+        if len(results) == 1:
+            selected = next(iter(results))
+            content, consumed = results[selected]
+            return content, consumed, selected, (selected,)
+
+        contents = [result[0] for result in results.values()]
+        consumed_values = {result[1] for result in results.values()}
+        if len(set(contents)) == 1 and len(consumed_values) == 1:
+            consumed = consumed_values.pop()
+            return (
+                contents[0],
+                consumed,
+                "utf-8-or-gb18030",
+                tuple(results),
+            )
+
+        shared_content, shared_bytes = self._shared_decode_boundary(
+            relative_path,
+            tuple(results),
+            offset,
+            chunk,
+        )
+        return (
+            shared_content,
+            shared_bytes,
+            "utf-8-or-gb18030",
+            tuple(results),
+        )
+
+    def _shared_decode_boundary(
+        self,
+        relative_path: str,
+        candidates: tuple[str, ...],
+        offset: int,
+        chunk: bytes,
+    ) -> tuple[str, int]:
+        decoders = {
+            candidate: codecs.getincrementaldecoder(
+                self._decoder_encoding(
+                    relative_path,
+                    candidate,
+                    offset,
+                )
+            )(errors="strict")
+            for candidate in candidates
+        }
+        outputs = {candidate: "" for candidate in candidates}
+        shared_content = ""
+        shared_bytes = 0
+
+        for byte_count, byte in enumerate(chunk, start=1):
+            for candidate in tuple(decoders):
+                try:
+                    outputs[candidate] += decoders[candidate].decode(
+                        bytes((byte,)),
+                        final=False,
+                    )
+                except UnicodeDecodeError:
+                    del decoders[candidate]
+                    del outputs[candidate]
+            if len(decoders) < 2:
+                break
+            if len(set(outputs.values())) == 1 and all(
+                not decoder.getstate()[0]
+                for decoder in decoders.values()
             ):
-                selected = encoding
-            return content, consumed, selected
-        assert last_error is not None
-        raise last_error
+                shared_content = next(iter(outputs.values()))
+                shared_bytes = byte_count
+        return shared_content, shared_bytes
 
     def _decoder_encoding(
         self,
@@ -1195,22 +1415,28 @@ class WorkspaceTools:
         self,
         relative_path: str,
         offset: int,
-        encoding: str,
+        candidates: tuple[str, ...],
     ) -> int | None:
-        decoder_encoding = self._decoder_encoding(
-            relative_path,
-            encoding,
-            offset,
-        )
         _, handle = self._open_file(relative_path, "rb")
         with handle:
             handle.seek(offset)
             probe = handle.read(_MAX_CHARACTER_PROBE_BYTES)
 
-        decoder = codecs.getincrementaldecoder(decoder_encoding)(
-            errors="strict"
-        )
-        for byte_count, byte in enumerate(probe, start=1):
-            if decoder.decode(bytes((byte,)), final=False):
-                return byte_count
-        return None
+        minimums: list[int] = []
+        for candidate in candidates:
+            decoder_encoding = self._decoder_encoding(
+                relative_path,
+                candidate,
+                offset,
+            )
+            decoder = codecs.getincrementaldecoder(decoder_encoding)(
+                errors="strict"
+            )
+            try:
+                for byte_count, byte in enumerate(probe, start=1):
+                    if decoder.decode(bytes((byte,)), final=False):
+                        minimums.append(byte_count)
+                        break
+            except UnicodeDecodeError:
+                continue
+        return min(minimums) if minimums else None
