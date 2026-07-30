@@ -220,21 +220,23 @@ def test_search_files_streams_to_a_large_file_tail(tmp_path: Path) -> None:
     assert len(repr(result.data)) < 1_000
 
 
-def test_search_files_uses_sorted_depth_first_file_order(
+def test_search_files_uses_global_lexical_file_order(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "workspace"
     (root / "a").mkdir(parents=True)
     (root / "a" / "nested.txt").write_text("hit", encoding="utf-8")
     (root / "a.txt").write_text("hit", encoding="utf-8")
+    (root / "aa.txt").write_text("hit", encoding="utf-8")
     (root / "b.txt").write_text("hit", encoding="utf-8")
 
     result = _tools(root).search_files("hit")
 
     assert result.ok
     assert [match["path"] for match in result.data["matches"]] == [
-        "a/nested.txt",
         "a.txt",
+        "a/nested.txt",
+        "aa.txt",
         "b.txt",
     ]
 

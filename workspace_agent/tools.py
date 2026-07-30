@@ -537,6 +537,7 @@ class WorkspaceTools:
         if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
             return
 
+        candidates: list[tuple[str, str, str]] = []
         for name in self._scan_names(directory):
             relative_path = (
                 name if directory == "." else f"{directory.rstrip('/')}/{name}"
@@ -558,8 +559,14 @@ class WorkspaceTools:
 
             kind = _path_type(child_metadata)
             if kind == "file":
-                yield relative_path
+                candidates.append((relative_path, relative_path, kind))
             elif kind == "directory":
+                candidates.append((f"{relative_path}/", relative_path, kind))
+
+        for _, relative_path, kind in sorted(candidates):
+            if kind == "file":
+                yield relative_path
+            else:
                 yield from self._iter_files(relative_path, warnings)
 
     def _iter_matches(
