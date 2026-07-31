@@ -6,8 +6,10 @@ import json
 import os
 import shutil
 import stat
+import tempfile
 import threading
 import time
+import uuid
 from collections import OrderedDict, deque
 from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
@@ -19,6 +21,7 @@ from fastapi import (
     FastAPI,
     HTTPException,
     Query,
+    Request,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -37,12 +40,23 @@ from workspace_agent.trace import TraceStore
 _TASK_LIMIT = 4000
 _MAX_RUN_FRAME_CHARS = 8192
 _INITIAL_MESSAGE_TIMEOUT_SECONDS = 15.0
+_TERMINAL_SEND_TIMEOUT_SECONDS = 0.25
 _DEFAULT_LIMITER_KEYS = 1024
+_MAX_FORWARDED_FOR_CHARS = 2048
+_MAX_FORWARDED_FOR_HOPS = 20
+_MAX_TRUSTED_PROXY_CIDRS = 64
 _ORIGIN_ERROR = "allowed_origin must be a valid HTTP origin"
+_TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_failed"})
 
 
 class _InvalidRunRequest(ValueError):
     pass
+
+
+class _ResetError(RuntimeError):
+    def __init__(self, error_code: str = "RESET_FAILED") -> None:
+        super().__init__("workspace reset failed")
+        self.error_code = error_code
 
 
 class SlidingWindowLimiter:
@@ -193,6 +207,95 @@ def _normalize_origin_host(hostname: str) -> str:
     return normalized
 
 
+def _parse_trusted_proxy_cidrs(
+    value: str,
+) -> tuple[
+    ipaddress.IPv4Network | ipaddress.IPv6Network,
+    ...,
+]:
+    if not isinstance(value, str):
+        raise ValueError("trusted proxy configuration is invalid")
+    stripped = value.strip()
+    if not stripped:
+        return ()
+    if len(value) > _MAX_FORWARDED_FOR_CHARS:
+        raise ValueError("trusted proxy configuration is invalid")
+    parts = [part.strip() for part in value.split(",")]
+    if (
+        len(parts) > _MAX_TRUSTED_PROXY_CIDRS
+        or any(not part for part in parts)
+    ):
+        raise ValueError("trusted proxy configuration is invalid")
+    try:
+        return tuple(
+            ipaddress.ip_network(part, strict=False)
+            for part in parts
+        )
+    except ValueError:
+        raise ValueError("trusted proxy configuration is invalid") from None
+
+
+def _address_is_trusted(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    networks: tuple[
+        ipaddress.IPv4Network | ipaddress.IPv6Network,
+        ...,
+    ],
+) -> bool:
+    return any(
+        address.version == network.version and address in network
+        for network in networks
+    )
+
+
+def _client_key(
+    connection: Any,
+    trusted_proxy_networks: tuple[
+        ipaddress.IPv4Network | ipaddress.IPv6Network,
+        ...,
+    ],
+) -> str:
+    client = getattr(connection, "client", None)
+    peer_value = getattr(client, "host", None)
+    try:
+        peer = ipaddress.ip_address(peer_value)
+    except (TypeError, ValueError):
+        return "unknown"
+    peer_key = peer.compressed
+    if not _address_is_trusted(peer, trusted_proxy_networks):
+        return peer_key
+
+    headers = getattr(connection, "headers", {})
+    getlist = getattr(headers, "getlist", None)
+    if callable(getlist):
+        values = getlist("x-forwarded-for")
+        if len(values) != 1:
+            return peer_key
+        forwarded_for = values[0]
+    else:
+        forwarded_for = headers.get("x-forwarded-for")
+    if not isinstance(forwarded_for, str):
+        return peer_key
+    if len(forwarded_for) > _MAX_FORWARDED_FOR_CHARS:
+        return peer_key
+    parts = forwarded_for.split(",")
+    if (
+        not parts
+        or len(parts) > _MAX_FORWARDED_FOR_HOPS
+        or any(not part.strip() for part in parts)
+    ):
+        return peer_key
+    try:
+        addresses = [ipaddress.ip_address(part.strip()) for part in parts]
+    except ValueError:
+        return peer_key
+
+    for address in reversed([*addresses, peer]):
+        if not _address_is_trusted(address, trusted_proxy_networks):
+            return address.compressed
+    return peer_key
+
+
 def _is_link_or_reparse(metadata: os.stat_result) -> bool:
     file_attributes = getattr(metadata, "st_file_attributes", 0)
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
@@ -221,6 +324,60 @@ def _remove_entry(path: Path) -> None:
         os.rmdir(path)
         return
     os.unlink(path)
+
+
+def _runtime_roots_are_separate(paths: tuple[Path, ...]) -> bool:
+    canonical = [
+        os.path.normcase(os.path.realpath(path))
+        for path in paths
+    ]
+    for index, left in enumerate(canonical):
+        for right in canonical[index + 1 :]:
+            try:
+                common = os.path.commonpath((left, right))
+            except ValueError:
+                continue
+            if common == left or common == right:
+                return False
+    return True
+
+
+def _validate_seed_root(seed_root: Path) -> None:
+    try:
+        metadata = os.lstat(seed_root)
+        if (
+            _is_link_or_reparse(metadata)
+            or not stat.S_ISDIR(metadata.st_mode)
+            or not os.access(seed_root, os.R_OK)
+        ):
+            raise ValueError("seed root is invalid")
+        with os.scandir(seed_root) as entries:
+            next(entries)
+    except (OSError, StopIteration):
+        raise ValueError("seed root is invalid") from None
+
+
+def _prepare_runtime_roots(settings: Settings) -> tuple[
+    WorkspaceGuard,
+    WorkspaceGuard,
+]:
+    roots = (
+        settings.workspace_root,
+        settings.seed_root,
+        settings.trace_root,
+        settings.static_root,
+    )
+    if not _runtime_roots_are_separate(roots):
+        raise ValueError("runtime roots must be separate")
+    _validate_seed_root(settings.seed_root)
+    try:
+        workspace_guard = WorkspaceGuard(settings.workspace_root)
+        seed_guard = WorkspaceGuard(settings.seed_root)
+        WorkspaceGuard(settings.trace_root)
+        WorkspaceGuard(settings.static_root)
+    except (OSError, ValueError):
+        raise ValueError("runtime root is invalid") from None
+    return workspace_guard, seed_guard
 
 
 def _copy_seed_directory(
@@ -261,22 +418,95 @@ def _copy_seed_directory(
             raise RuntimeError("seed contains an unsupported entry")
 
 
+def _validate_physical_tree(
+    root: Path,
+    *,
+    require_nonempty: bool = False,
+) -> None:
+    metadata = os.lstat(root)
+    if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise _ResetError()
+    with os.scandir(root) as entries:
+        children = [Path(entry.path) for entry in entries]
+    if require_nonempty and not children:
+        raise _ResetError()
+    for child in children:
+        child_metadata = os.lstat(child)
+        if _is_link_or_reparse(child_metadata):
+            raise _ResetError()
+        if stat.S_ISDIR(child_metadata.st_mode):
+            _validate_physical_tree(child)
+        elif not stat.S_ISREG(child_metadata.st_mode):
+            raise _ResetError()
+
+
+def _cleanup_reset_path(path: Path) -> None:
+    if os.path.lexists(path):
+        _remove_entry(path)
+
+
 def _reset_workspace(settings: Settings) -> None:
     workspace_guard = WorkspaceGuard(settings.workspace_root)
     seed_guard = WorkspaceGuard(settings.seed_root)
-    with os.scandir(workspace_guard.root) as entries:
-        children = [Path(entry.path) for entry in entries]
-    for child in children:
-        _remove_entry(child)
-    _copy_seed_directory(seed_guard, workspace_guard)
+    workspace = workspace_guard.root
+    parent = workspace.parent
+    staging = Path(
+        tempfile.mkdtemp(prefix=".workspace-reset-stage-", dir=parent)
+    )
+    backup = parent / f".workspace-reset-backup-{uuid.uuid4().hex}"
+
+    try:
+        staging_guard = WorkspaceGuard(staging)
+        _copy_seed_directory(seed_guard, staging_guard)
+        _validate_physical_tree(staging, require_nonempty=True)
+
+        try:
+            os.replace(workspace, backup)
+        except OSError:
+            raise _ResetError() from None
+
+        try:
+            # Single-process deployment: this checked rename sequence assumes
+            # no malicious local process mutates these roots concurrently.
+            os.replace(staging, workspace)
+        except OSError:
+            try:
+                os.replace(backup, workspace)
+            except OSError:
+                raise _ResetError("RESET_ROLLBACK_FAILED") from None
+            try:
+                _cleanup_reset_path(staging)
+            except OSError:
+                raise _ResetError("RESET_CLEANUP_FAILED") from None
+            raise _ResetError() from None
+
+        try:
+            _cleanup_reset_path(backup)
+        except OSError:
+            raise _ResetError("RESET_CLEANUP_FAILED") from None
+    except _ResetError:
+        try:
+            _cleanup_reset_path(staging)
+        except OSError:
+            raise _ResetError("RESET_CLEANUP_FAILED") from None
+        raise
+    except Exception:
+        try:
+            _cleanup_reset_path(staging)
+        except OSError:
+            raise _ResetError("RESET_CLEANUP_FAILED") from None
+        raise _ResetError() from None
 
 
-async def _run_reset_worker(settings: Settings) -> None:
+async def _run_thread_worker(
+    function: Callable[..., Any],
+    *arguments: Any,
+) -> Any:
     worker = asyncio.create_task(
-        asyncio.to_thread(_reset_workspace, settings)
+        asyncio.to_thread(function, *arguments)
     )
     try:
-        await asyncio.shield(worker)
+        return await asyncio.shield(worker)
     except asyncio.CancelledError:
         while not worker.done():
             try:
@@ -289,6 +519,20 @@ async def _run_reset_worker(settings: Settings) -> None:
             with suppress(BaseException):
                 worker.result()
         raise
+
+
+async def _run_reset_worker(settings: Settings) -> None:
+    await _run_thread_worker(_reset_workspace, settings)
+
+
+def _workspace_busy_error() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error_code": "WORKSPACE_BUSY",
+            "message": "Workspace is busy",
+        },
+    )
 
 
 def _tool_status(error_code: str | None) -> int:
@@ -327,6 +571,42 @@ async def _send_failure(
         return
     with suppress(RuntimeError, WebSocketDisconnect):
         await socket.close(code=close_code)
+
+
+class _RunChannel:
+    def __init__(self, socket: WebSocket) -> None:
+        self._socket = socket
+        self._lock = asyncio.Lock()
+        self._terminal_source: str | None = None
+
+    @property
+    def runner_terminal_sent(self) -> bool:
+        return self._terminal_source == "runner"
+
+    async def send_runner_event(self, event: dict[str, Any]) -> None:
+        async with self._lock:
+            if self._terminal_source is not None:
+                return
+            await self._socket.send_json(event)
+            if event.get("type") in _TERMINAL_EVENT_TYPES:
+                self._terminal_source = "runner"
+                with suppress(RuntimeError, WebSocketDisconnect):
+                    await self._socket.close(code=1000)
+
+    async def send_failure(self, message: str, *, close_code: int) -> bool:
+        async with self._lock:
+            if self._terminal_source is not None:
+                return False
+            try:
+                await self._socket.send_json(
+                    {"type": "run_failed", "message": message}
+                )
+            except (RuntimeError, WebSocketDisconnect):
+                return False
+            self._terminal_source = "control"
+            with suppress(RuntimeError, WebSocketDisconnect):
+                await self._socket.close(code=close_code)
+            return True
 
 
 def _reject_json_constant(value: str) -> None:
@@ -395,52 +675,138 @@ async def _watch_client(socket: WebSocket) -> str:
     return "extra-message"
 
 
+async def _cancel_and_settle_task(
+    task: asyncio.Task[Any],
+    *,
+    propagate_cancellation: bool = True,
+) -> None:
+    if not task.done():
+        task.cancel()
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                interrupted = True
+        except BaseException:
+            break
+    if task.done() and not task.cancelled():
+        with suppress(BaseException):
+            task.result()
+    if interrupted and propagate_cancellation:
+        raise asyncio.CancelledError
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    if not task.cancelled():
+        with suppress(BaseException):
+            task.result()
+
+
+async def _send_channel_failure_bounded(
+    channel: _RunChannel,
+    message: str,
+    *,
+    close_code: int,
+) -> None:
+    send_task = asyncio.create_task(
+        channel.send_failure(message, close_code=close_code)
+    )
+    done, _ = await asyncio.wait(
+        {send_task},
+        timeout=_TERMINAL_SEND_TIMEOUT_SECONDS,
+    )
+    if send_task in done:
+        _consume_task_result(send_task)
+        return
+    send_task.cancel()
+    send_task.add_done_callback(_consume_task_result)
+
+
 async def _run_with_disconnect_monitor(
     socket: WebSocket,
     runner: AgentRunner,
     task: str,
+    *,
+    max_run_seconds: float = 300.0,
 ) -> None:
-    async def send_event(event: dict[str, Any]) -> None:
-        await socket.send_json(event)
-
+    channel = _RunChannel(socket)
     client_task = asyncio.create_task(_watch_client(socket))
     await asyncio.sleep(0)
     if client_task.done():
         client_state = await client_task
         if client_state == "extra-message":
-            await _send_failure(
-                socket,
+            await _send_channel_failure_bounded(
+                channel,
                 "Invalid run request",
                 close_code=1008,
             )
         return
 
-    runner_task = asyncio.create_task(runner.run(task, send_event))
-    done, _ = await asyncio.wait(
-        {runner_task, client_task},
-        return_when=asyncio.FIRST_COMPLETED,
+    runner_task = asyncio.create_task(
+        runner.run(task, channel.send_runner_event)
     )
-
-    if client_task in done:
-        client_state = await client_task
-        runner_task.cancel()
-        with suppress(asyncio.CancelledError, RuntimeError, WebSocketDisconnect):
-            await runner_task
-        if client_state == "extra-message":
-            await _send_failure(
-                socket,
-                "Invalid run request",
-                close_code=1008,
-            )
-        return
-
-    client_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await client_task
+    deadline_task = asyncio.create_task(asyncio.sleep(max_run_seconds))
     try:
-        await runner_task
-    except (RuntimeError, WebSocketDisconnect):
-        return
+        done, _ = await asyncio.wait(
+            {runner_task, client_task, deadline_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if channel.runner_terminal_sent:
+            await _cancel_and_settle_task(client_task)
+            await _cancel_and_settle_task(deadline_task)
+            if not runner_task.done():
+                await _cancel_and_settle_task(runner_task)
+            else:
+                _consume_task_result(runner_task)
+            return
+
+        if client_task in done:
+            client_state = await client_task
+            await _cancel_and_settle_task(deadline_task)
+            await _cancel_and_settle_task(
+                runner_task,
+                propagate_cancellation=client_state != "disconnected",
+            )
+            if client_state == "extra-message":
+                await _send_channel_failure_bounded(
+                    channel,
+                    "Invalid run request",
+                    close_code=1008,
+                )
+            return
+
+        if runner_task in done:
+            await _cancel_and_settle_task(client_task)
+            await _cancel_and_settle_task(deadline_task)
+            _consume_task_result(runner_task)
+            if not channel.runner_terminal_sent:
+                await _send_channel_failure_bounded(
+                    channel,
+                    "Run failed",
+                    close_code=1011,
+                )
+            return
+
+        await _cancel_and_settle_task(client_task)
+        await _cancel_and_settle_task(runner_task)
+        await _send_channel_failure_bounded(
+            channel,
+            "Run timed out",
+            close_code=1011,
+        )
+    except asyncio.CancelledError:
+        await _cancel_and_settle_task(runner_task)
+        await _cancel_and_settle_task(client_task)
+        await _cancel_and_settle_task(deadline_task)
+        raise
+    finally:
+        for pending_task in (runner_task, client_task, deadline_task):
+            if not pending_task.done():
+                pending_task.cancel()
+                pending_task.add_done_callback(_consume_task_result)
 
 
 def create_app(
@@ -449,38 +815,36 @@ def create_app(
 ) -> FastAPI:
     configured = settings or Settings()
     allowed_origin = _normalize_http_origin(configured.allowed_origin)
-    configured.workspace_root.mkdir(parents=True, exist_ok=True)
-    configured.seed_root.mkdir(parents=True, exist_ok=True)
-    configured.trace_root.mkdir(parents=True, exist_ok=True)
-    configured.static_root.mkdir(parents=True, exist_ok=True)
-
-    guard = WorkspaceGuard(configured.workspace_root)
+    trusted_proxy_networks = _parse_trusted_proxy_cidrs(
+        configured.trusted_proxy_cidrs
+    )
+    guard, _ = _prepare_runtime_roots(configured)
     tools = WorkspaceTools(
         guard,
         max_read_bytes=configured.max_read_bytes,
         max_write_bytes=configured.max_write_bytes,
     )
     traces = TraceStore(configured.trace_root)
-    selected_model = model
-    owns_model = False
-    if selected_model is None and configured.llm_api_key:
-        selected_model = OpenAICompatibleModel(
-            base_url=configured.llm_base_url,
-            api_key=configured.llm_api_key,
-            model=configured.llm_model,
-            timeout_seconds=configured.request_timeout_seconds,
-        )
-        owns_model = True
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        owned_model: Any | None = None
+        if model is None and configured.llm_api_key:
+            owned_model = OpenAICompatibleModel(
+                base_url=configured.llm_base_url,
+                api_key=configured.llm_api_key,
+                model=configured.llm_model,
+                timeout_seconds=configured.request_timeout_seconds,
+            )
+            application.state.model = owned_model
         try:
             yield
         finally:
-            if owns_model:
-                close = getattr(selected_model, "aclose", None)
+            if owned_model is not None:
+                close = getattr(owned_model, "aclose", None)
                 if close is not None:
                     await close()
+            application.state.model = model
 
     app = FastAPI(
         title="Workspace Agent",
@@ -491,14 +855,18 @@ def create_app(
     app.state.settings = configured
     app.state.tools = tools
     app.state.traces = traces
-    app.state.model = selected_model
+    app.state.model = model
     app.state.allowed_origin = allowed_origin
+    app.state.trusted_proxy_networks = trusted_proxy_networks
     app.state.workspace_lock = _CapacityGate(1)
     app.state.run_slots = _CapacityGate(configured.max_concurrent_runs)
     app.state.connection_slots = _CapacityGate(
         max(2, configured.max_concurrent_runs * 2)
     )
     app.state.rate_limiter = SlidingWindowLimiter(
+        configured.rate_limit_per_minute
+    )
+    app.state.reset_rate_limiter = SlidingWindowLimiter(
         configured.rate_limit_per_minute
     )
     app.mount(
@@ -541,13 +909,18 @@ def create_app(
         ] = None,
         limit: Annotated[int, Query(ge=1, le=200)] = 200,
     ) -> dict[str, Any]:
-        result = await asyncio.to_thread(
-            tools.list_dir,
-            path,
-            recursive,
-            cursor,
-            limit,
-        )
+        if not app.state.workspace_lock.try_acquire():
+            raise _workspace_busy_error()
+        try:
+            result = await _run_thread_worker(
+                tools.list_dir,
+                path,
+                recursive,
+                cursor,
+                limit,
+            )
+        finally:
+            app.state.workspace_lock.release()
         if not result.ok:
             raise _tool_http_error(result.error_code, "Tree request failed")
         return result.data
@@ -562,30 +935,70 @@ def create_app(
             Query(min_length=1, max_length=4096),
         ] = None,
     ) -> dict[str, Any]:
-        result = await asyncio.to_thread(
-            tools.read_file,
-            path,
-            offset,
-            limit,
-            cursor,
-        )
+        if not app.state.workspace_lock.try_acquire():
+            raise _workspace_busy_error()
+        try:
+            result = await _run_thread_worker(
+                tools.read_file,
+                path,
+                offset,
+                limit,
+                cursor,
+            )
+        finally:
+            app.state.workspace_lock.release()
         if not result.ok:
             raise _tool_http_error(result.error_code, "File request failed")
         return result.data
 
     @app.post("/api/reset")
-    async def reset() -> dict[str, str]:
-        if not app.state.workspace_lock.try_acquire():
+    async def reset(request: Request) -> dict[str, str]:
+        try:
+            request_origin = _normalize_http_origin(
+                request.headers.get("origin")
+            )
+        except ValueError:
+            request_origin = None
+        if request_origin != app.state.allowed_origin:
             raise HTTPException(
-                status_code=409,
+                status_code=403,
                 detail={
-                    "error_code": "WORKSPACE_BUSY",
-                    "message": "Workspace is busy",
+                    "error_code": "ORIGIN_REJECTED",
+                    "message": "Origin is not allowed",
                 },
             )
+        client_key = _client_key(
+            request,
+            app.state.trusted_proxy_networks,
+        )
+        if not app.state.reset_rate_limiter.allow(client_key):
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error_code": "RATE_LIMITED",
+                    "message": "Too many reset requests",
+                },
+            )
+        if not app.state.workspace_lock.try_acquire():
+            raise _workspace_busy_error()
         try:
             try:
                 await _run_reset_worker(configured)
+            except _ResetError as error:
+                message = (
+                    "Workspace reset cleanup failed"
+                    if error.error_code == "RESET_CLEANUP_FAILED"
+                    else "Workspace reset rollback failed"
+                    if error.error_code == "RESET_ROLLBACK_FAILED"
+                    else "Workspace reset failed"
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "error_code": error.error_code,
+                        "message": message,
+                    },
+                ) from None
             except Exception:
                 raise HTTPException(
                     status_code=500,
@@ -635,7 +1048,10 @@ def create_app(
             await socket.close(code=1008, reason="origin rejected")
             return
 
-        client_key = socket.client.host if socket.client else "unknown"
+        client_key = _client_key(
+            socket,
+            app.state.trusted_proxy_networks,
+        )
         if not app.state.rate_limiter.allow(client_key):
             await socket.close(code=1013, reason="rate limit exceeded")
             return
@@ -691,7 +1107,12 @@ def create_app(
                 traces=app.state.traces,
                 max_model_calls=configured.max_model_calls,
             )
-            await _run_with_disconnect_monitor(socket, runner, task)
+            await _run_with_disconnect_monitor(
+                socket,
+                runner,
+                task,
+                max_run_seconds=configured.max_run_seconds,
+            )
         except WebSocketDisconnect:
             return
         except Exception:
@@ -711,4 +1132,24 @@ def create_app(
     return app
 
 
-app = create_app()
+class _LazyApplication:
+    def __init__(self) -> None:
+        self._application: FastAPI | None = None
+        self._lock = threading.Lock()
+
+    async def __call__(
+        self,
+        scope: dict[str, Any],
+        receive: Callable[..., Any],
+        send: Callable[..., Any],
+    ) -> None:
+        application = self._application
+        if application is None:
+            with self._lock:
+                if self._application is None:
+                    self._application = create_app()
+                application = self._application
+        await application(scope, receive, send)
+
+
+app = _LazyApplication()

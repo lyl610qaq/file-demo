@@ -8,6 +8,7 @@ import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -45,6 +46,19 @@ class BlockingModel:
         self.started.set()
         await asyncio.to_thread(self.release.wait)
         return ModelReply(message={"role": "assistant", "content": "Finished"})
+
+
+class SlowModel:
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+
+    async def complete(self, messages, tools) -> ModelReply:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+        raise AssertionError("slow model unexpectedly completed")
 
 
 class ClosableModel(FinalOnlyModel):
@@ -113,6 +127,15 @@ def receive_until_terminal(socket) -> list[dict[str, Any]]:
             return events
 
 
+def post_reset(
+    client: TestClient | AsyncClient,
+    *,
+    origin: str | None = "http://testserver",
+):
+    headers = {} if origin is None else {"origin": origin}
+    return client.post("/api/reset", headers=headers)
+
+
 def test_index_assets_health_meta_tree_file_and_reset(tmp_path: Path) -> None:
     app = create_app(settings_for(tmp_path), model=FinalOnlyModel())
 
@@ -128,7 +151,7 @@ def test_index_assets_health_meta_tree_file_and_reset(tmp_path: Path) -> None:
         assert client.get("/api/file", params={"path": "a.md"}).json()[
             "content"
         ] == "body"
-        assert client.post("/api/reset").json() == {"status": "reset"}
+        assert post_reset(client).json() == {"status": "reset"}
         assert client.get(
             "/api/file", params={"path": "seed.md"}
         ).status_code == 200
@@ -524,6 +547,248 @@ async def test_queued_extra_frame_is_rejected_before_runner_starts() -> None:
     assert "unexpected-second-frame-secret" not in json.dumps(socket.sent)
 
 
+@pytest.mark.asyncio
+async def test_runner_terminal_wins_a_simultaneous_extra_frame_and_latches() -> None:
+    from workspace_agent import web
+
+    class RacingSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+            self.close_code: int | None = None
+            self.terminal_sent = asyncio.Event()
+
+        async def receive(self) -> dict[str, Any]:
+            await self.terminal_sent.wait()
+            return {
+                "type": "websocket.receive",
+                "text": "simultaneous-extra-secret",
+            }
+
+        async def send_json(self, event: dict[str, Any]) -> None:
+            self.sent.append(event)
+            if event["type"] in {"run_completed", "run_failed"}:
+                self.terminal_sent.set()
+                await asyncio.sleep(0)
+
+        async def close(self, code: int) -> None:
+            self.close_code = code
+
+    class DuplicateTerminalRunner:
+        async def run(self, task: str, sink) -> None:
+            await sink({"type": "run_completed", "message": "done"})
+            await sink({"type": "run_failed", "message": "duplicate"})
+
+    socket = RacingSocket()
+
+    await web._run_with_disconnect_monitor(
+        socket,
+        DuplicateTerminalRunner(),
+        "Inspect",
+    )
+
+    assert socket.sent == [{"type": "run_completed", "message": "done"}]
+    assert socket.close_code == 1000
+    assert "simultaneous-extra-secret" not in json.dumps(socket.sent)
+
+
+def test_websocket_run_timeout_cancels_model_and_sends_one_terminal(
+    tmp_path: Path,
+) -> None:
+    model = SlowModel()
+    app = create_app(
+        settings_for(tmp_path, max_run_seconds=0.05),
+        model=model,
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws/agent",
+            headers={"origin": "http://testserver"},
+        ) as socket:
+            socket.send_json({"type": "run", "task": "Wait forever"})
+            events = receive_until_terminal(socket)
+            with pytest.raises(WebSocketDisconnect) as closed:
+                socket.receive_json()
+
+    terminals = [
+        event
+        for event in events
+        if event["type"] in {"run_completed", "run_failed"}
+    ]
+    assert terminals == [{"type": "run_failed", "message": "Run timed out"}]
+    assert closed.value.code == 1011
+    assert model.cancelled.wait(2)
+
+
+def test_websocket_timeout_waits_for_tool_before_releasing_workspace(
+    tmp_path: Path,
+) -> None:
+    call = ToolCall("call-timeout", "stat_path", {"path": "."})
+    app = create_app(
+        settings_for(tmp_path, max_run_seconds=0.05),
+        model=ScriptedModel(tool_reply(call)),
+    )
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_execute(name: str, arguments: dict[str, Any]) -> ToolResult:
+        started.set()
+        release.wait()
+        finished.set()
+        return ToolResult(ok=True, data={}, summary="settled")
+
+    app.state.tools.execute = blocking_execute
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws/agent",
+            headers={"origin": "http://testserver"},
+        ) as socket:
+            socket.send_json({"type": "run", "task": "Use a slow tool"})
+            while socket.receive_json()["type"] != "tool_started":
+                pass
+            assert started.wait(2)
+            threading.Timer(0.15, release.set).start()
+            terminal = socket.receive_json()
+            assert finished.is_set()
+
+        reset = post_reset(client)
+
+    assert terminal == {"type": "run_failed", "message": "Run timed out"}
+    assert reset.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_run_timeout_cancels_a_stuck_event_send() -> None:
+    from workspace_agent import web
+
+    class StuckSendSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+            self.close_code: int | None = None
+            self.first_send_cancelled = asyncio.Event()
+            self.never = asyncio.Event()
+            self.calls = 0
+
+        async def receive(self) -> dict[str, Any]:
+            await self.never.wait()
+            raise AssertionError("receive unexpectedly resumed")
+
+        async def send_json(self, event: dict[str, Any]) -> None:
+            self.calls += 1
+            if self.calls == 1:
+                try:
+                    await self.never.wait()
+                except asyncio.CancelledError:
+                    self.first_send_cancelled.set()
+                    raise
+            self.sent.append(event)
+
+        async def close(self, code: int) -> None:
+            self.close_code = code
+
+    class EventOnlyRunner:
+        async def run(self, task: str, sink) -> None:
+            await sink({"type": "run_started"})
+
+    socket = StuckSendSocket()
+    await asyncio.wait_for(
+        web._run_with_disconnect_monitor(
+            socket,
+            EventOnlyRunner(),
+            "Inspect",
+            max_run_seconds=0.05,
+        ),
+        timeout=1,
+    )
+
+    assert socket.first_send_cancelled.is_set()
+    assert socket.sent == [{"type": "run_failed", "message": "Run timed out"}]
+    assert socket.close_code == 1011
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_waits_for_runner_before_gate_release() -> None:
+    from workspace_agent import web
+
+    class WaitingSocket:
+        def __init__(self) -> None:
+            self.never = asyncio.Event()
+
+        async def receive(self) -> dict[str, Any]:
+            await self.never.wait()
+            raise AssertionError("receive unexpectedly resumed")
+
+        async def send_json(self, event: dict[str, Any]) -> None:
+            return None
+
+        async def close(self, code: int) -> None:
+            return None
+
+    class SettlingRunner:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.cancelling = asyncio.Event()
+            self.release = asyncio.Event()
+            self.settled = asyncio.Event()
+
+        async def run(self, task: str, sink) -> None:
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelling.set()
+                while not self.release.is_set():
+                    try:
+                        await asyncio.shield(self.release.wait())
+                    except asyncio.CancelledError:
+                        continue
+                self.settled.set()
+                raise
+
+    gate = web._CapacityGate(1)
+    assert gate.try_acquire()
+    runner = SettlingRunner()
+    order: list[str] = []
+
+    async def run_with_gate() -> None:
+        try:
+            await web._run_with_disconnect_monitor(
+                WaitingSocket(),
+                runner,
+                "Inspect",
+                max_run_seconds=0.05,
+            )
+        finally:
+            order.append("gate_release")
+            gate.release()
+
+    run_task = asyncio.create_task(run_with_gate())
+    await runner.started.wait()
+    await runner.cancelling.wait()
+    run_task.cancel()
+    await asyncio.sleep(0)
+    run_task.cancel()
+    await asyncio.sleep(0)
+
+    finished_early = run_task.done()
+    entered_early = gate.try_acquire()
+    if entered_early:
+        gate.release()
+
+    runner.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert finished_early is False
+    assert entered_early is False
+    assert runner.settled.is_set()
+    assert order == ["gate_release"]
+    assert gate.try_acquire()
+    gate.release()
+
+
 def test_websocket_reports_missing_model_without_secrets(tmp_path: Path) -> None:
     settings = settings_for(tmp_path, llm_api_key="")
     app = create_app(settings)
@@ -577,9 +842,14 @@ def test_run_slot_rejects_immediately_and_reset_conflicts_with_run(
             assert first.receive_json()["type"] == "model_call_started"
             assert model.started.wait(2)
 
-            reset = client.post("/api/reset")
-            assert reset.status_code == 409
-            assert reset.json()["detail"]["error_code"] == "WORKSPACE_BUSY"
+            busy_reads = []
+            for path, params in (
+                ("/api/tree", {}),
+                ("/api/file", {"path": "a.md"}),
+            ):
+                busy_reads.append(client.get(path, params=params))
+
+            reset = post_reset(client)
 
             with client.websocket_connect(
                 "/ws/agent",
@@ -587,14 +857,19 @@ def test_run_slot_rejects_immediately_and_reset_conflicts_with_run(
             ) as second:
                 second.send_json({"type": "run", "task": "Second run"})
                 rejected = second.receive_json()
-            assert rejected == {
-                "type": "run_failed",
-                "message": "Server is busy",
-            }
 
             model.release.set()
             remaining = receive_until_terminal(first)
 
+    for busy_read in busy_reads:
+        assert busy_read.status_code == 409
+        assert busy_read.json()["detail"]["error_code"] == "WORKSPACE_BUSY"
+    assert reset.status_code == 409
+    assert reset.json()["detail"]["error_code"] == "WORKSPACE_BUSY"
+    assert rejected == {
+        "type": "run_failed",
+        "message": "Server is busy",
+    }
     assert remaining[-1]["type"] == "run_completed"
 
 
@@ -616,8 +891,14 @@ def test_run_is_rejected_while_reset_holds_the_workspace_gate(
 
     with TestClient(app) as client:
         with ThreadPoolExecutor(max_workers=1) as pool:
-            reset_future = pool.submit(client.post, "/api/reset")
+            reset_future = pool.submit(post_reset, client)
             assert started.wait(2)
+            busy_reads = []
+            for path, params in (
+                ("/api/tree", {}),
+                ("/api/file", {"path": "a.md"}),
+            ):
+                busy_reads.append(client.get(path, params=params))
             with client.websocket_connect(
                 "/ws/agent",
                 headers={"origin": "http://testserver"},
@@ -627,8 +908,77 @@ def test_run_is_rejected_while_reset_holds_the_workspace_gate(
             release.set()
             reset_response = reset_future.result(timeout=2)
 
+    for busy_read in busy_reads:
+        assert busy_read.status_code == 409
+        assert busy_read.json()["detail"]["error_code"] == "WORKSPACE_BUSY"
     assert event == {"type": "run_failed", "message": "Server is busy"}
     assert reset_response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        None,
+        "https://cross-site.example",
+        "http://testserver/path",
+        "http://testserver.evil.example",
+    ],
+)
+def test_reset_rejects_non_same_origin_without_running_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str | None,
+) -> None:
+    from workspace_agent import web
+
+    calls = 0
+
+    def tracked_reset(settings: Settings) -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(web, "_reset_workspace", tracked_reset)
+    app = create_app(settings_for(tmp_path), model=FinalOnlyModel())
+
+    with TestClient(app) as client:
+        response = post_reset(client, origin=origin)
+
+    assert response.status_code == 403
+    assert response.json() == {
+        "detail": {
+            "error_code": "ORIGIN_REJECTED",
+            "message": "Origin is not allowed",
+        }
+    }
+    assert calls == 0
+
+
+def test_reset_uses_an_independent_rate_limit_namespace(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        settings_for(tmp_path, rate_limit_per_minute=1),
+        model=FinalOnlyModel(),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws/agent",
+            headers={"origin": "http://testserver"},
+        ) as socket:
+            socket.send_json({"type": "run", "task": "Inspect"})
+            assert receive_until_terminal(socket)[-1]["type"] == "run_completed"
+
+        assert post_reset(client).status_code == 200
+        limited = post_reset(client)
+
+    assert limited.status_code == 429
+    assert limited.json() == {
+        "detail": {
+            "error_code": "RATE_LIMITED",
+            "message": "Too many reset requests",
+        }
+    }
 
 
 def test_connection_limit_rejects_idle_socket_without_waiting(
@@ -671,7 +1021,7 @@ def test_reset_removes_workspace_link_without_touching_target(
     app = create_app(settings, model=FinalOnlyModel())
 
     with TestClient(app) as client:
-        response = client.post("/api/reset")
+        response = post_reset(client)
 
     assert response.status_code == 200
     assert protected.read_text(encoding="utf-8") == "keep"
@@ -700,7 +1050,7 @@ def test_reset_removes_workspace_junction_without_touching_target(
 
     try:
         with TestClient(app) as client:
-            response = client.post("/api/reset")
+            response = post_reset(client)
         assert response.status_code == 200
         assert protected.read_text(encoding="utf-8") == "keep"
         assert not junction.exists()
@@ -724,7 +1074,7 @@ def test_reset_failure_is_stable_and_does_not_leak_paths(
     app = create_app(settings_for(tmp_path), model=FinalOnlyModel())
 
     with TestClient(app) as client:
-        response = client.post("/api/reset")
+        response = post_reset(client)
 
     assert response.status_code == 500
     assert response.json() == {
@@ -734,6 +1084,218 @@ def test_reset_failure_is_stable_and_does_not_leak_paths(
         }
     }
     assert secret not in response.text
+
+
+def test_create_app_rejects_missing_seed_without_creating_it(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    (settings.seed_root / "seed.md").unlink()
+    settings.seed_root.rmdir()
+
+    with pytest.raises(ValueError, match="^seed root is invalid$") as error:
+        create_app(settings, model=FinalOnlyModel())
+
+    assert not settings.seed_root.exists()
+    assert str(tmp_path) not in str(error.value)
+
+
+def test_create_app_rejects_empty_seed(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    (settings.seed_root / "seed.md").unlink()
+
+    with pytest.raises(ValueError, match="^seed root is invalid$") as error:
+        create_app(settings, model=FinalOnlyModel())
+
+    assert str(tmp_path) not in str(error.value)
+
+
+def test_create_app_rejects_seed_root_link(tmp_path: Path) -> None:
+    target = tmp_path / "seed-target"
+    target.mkdir()
+    (target / "seed.md").write_text("seed", encoding="utf-8")
+    link = tmp_path / "seed-link"
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0:
+            pytest.skip(created.stderr or created.stdout)
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+    try:
+        settings = settings_for(tmp_path / "app", seed_root=link)
+        with pytest.raises(
+            ValueError,
+            match="^seed root is invalid$",
+        ) as error:
+            create_app(settings, model=FinalOnlyModel())
+        assert str(tmp_path) not in str(error.value)
+    finally:
+        if os.path.lexists(link):
+            os.rmdir(link)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        lambda settings: {"seed_root": settings.workspace_root},
+        lambda settings: {
+            "trace_root": settings.workspace_root / "nested-traces"
+        },
+        lambda settings: {"static_root": settings.seed_root / "assets"},
+    ],
+)
+def test_create_app_rejects_equal_or_containing_runtime_roots(
+    tmp_path: Path,
+    overrides,
+) -> None:
+    settings = settings_for(tmp_path)
+    invalid = settings.model_copy(update=overrides(settings))
+
+    with pytest.raises(
+        ValueError,
+        match="^runtime roots must be separate$",
+    ) as error:
+        create_app(invalid, model=FinalOnlyModel())
+
+    assert str(tmp_path) not in str(error.value)
+
+
+def test_reset_rejects_seed_link_and_preserves_old_workspace(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    outside = tmp_path / "seed-outside"
+    outside.mkdir()
+    (outside / "payload.md").write_text("outside", encoding="utf-8")
+    link = settings.seed_root / "linked"
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(outside)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0:
+            pytest.skip(created.stderr or created.stdout)
+    else:
+        link.symlink_to(outside, target_is_directory=True)
+
+    try:
+        app = create_app(settings, model=FinalOnlyModel())
+        with TestClient(app) as client:
+            response = post_reset(client)
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == {
+            "error_code": "RESET_FAILED",
+            "message": "Workspace reset failed",
+        }
+        assert (settings.workspace_root / "a.md").read_text(
+            encoding="utf-8"
+        ) == "body"
+        assert not (settings.workspace_root / "seed.md").exists()
+    finally:
+        if os.path.lexists(link):
+            os.rmdir(link)
+
+
+def test_reset_accepts_a_seed_with_an_empty_directory(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    (settings.seed_root / "empty").mkdir()
+    app = create_app(settings, model=FinalOnlyModel())
+
+    with TestClient(app) as client:
+        response = post_reset(client)
+
+    assert response.status_code == 200
+    assert (settings.workspace_root / "empty").is_dir()
+
+
+def test_reset_rolls_back_when_workspace_exchange_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    original_replace = web.os.replace
+
+    def fail_stage_exchange(source: str | Path, destination: str | Path) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            source_path.name.startswith(".workspace-reset-stage-")
+            and destination_path == settings.workspace_root
+        ):
+            raise OSError(f"exchange failed at {tmp_path}")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(web.os, "replace", fail_stage_exchange)
+    app = create_app(settings, model=FinalOnlyModel())
+
+    with TestClient(app) as client:
+        response = post_reset(client)
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "error_code": "RESET_FAILED",
+        "message": "Workspace reset failed",
+    }
+    assert str(tmp_path) not in response.text
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert not (settings.workspace_root / "seed.md").exists()
+    assert not any(
+        entry.name.startswith(".workspace-reset-")
+        for entry in tmp_path.iterdir()
+    )
+
+
+def test_reset_reports_backup_cleanup_failure_without_leaking_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    original_cleanup = web._cleanup_reset_path
+    secret = str(tmp_path / "cleanup-secret")
+
+    def fail_backup_cleanup(path: Path) -> None:
+        if path.name.startswith(".workspace-reset-backup-"):
+            raise OSError(f"cleanup failed at {secret}")
+        original_cleanup(path)
+
+    monkeypatch.setattr(web, "_cleanup_reset_path", fail_backup_cleanup)
+    app = create_app(settings, model=FinalOnlyModel())
+
+    with TestClient(app) as client:
+        response = post_reset(client)
+
+    backups = [
+        entry
+        for entry in tmp_path.iterdir()
+        if entry.name.startswith(".workspace-reset-backup-")
+    ]
+    try:
+        assert response.status_code == 500
+        assert response.json()["detail"] == {
+            "error_code": "RESET_CLEANUP_FAILED",
+            "message": "Workspace reset cleanup failed",
+        }
+        assert secret not in response.text
+        assert (settings.workspace_root / "seed.md").is_file()
+        assert len(backups) == 1
+    finally:
+        for backup in backups:
+            original_cleanup(backup)
 
 
 @pytest.mark.asyncio
@@ -771,7 +1333,7 @@ async def test_cancelled_reset_settles_worker_before_releasing_workspace_lock(
         transport=transport,
         base_url="http://testserver",
     ) as client:
-        reset_task = asyncio.create_task(client.post("/api/reset"))
+        reset_task = asyncio.create_task(post_reset(client))
         assert await asyncio.to_thread(worker_started.wait, 2)
 
         reset_task.cancel()
@@ -826,7 +1388,7 @@ def test_websocket_disconnect_cancels_runner_and_waits_for_tool(
             threading.Timer(0.1, release.set).start()
 
         assert finished.wait(2)
-        assert client.post("/api/reset").status_code == 200
+        assert post_reset(client).status_code == 200
 
     trace_files = list((tmp_path / "traces").glob("*.jsonl"))
     assert len(trace_files) == 1
@@ -844,14 +1406,19 @@ def test_app_closes_only_the_model_it_constructed(
     from workspace_agent import web
 
     owned = ClosableModel()
+    factory_calls: list[dict[str, Any]] = []
 
     def model_factory(**kwargs: Any) -> ClosableModel:
         assert kwargs["api_key"] == "server-secret"
+        factory_calls.append(kwargs)
         return owned
 
     monkeypatch.setattr(web, "OpenAICompatibleModel", model_factory)
     configured = settings_for(tmp_path / "owned", llm_api_key="server-secret")
-    with TestClient(create_app(configured)):
+    owned_app = create_app(configured)
+    assert factory_calls == []
+    with TestClient(owned_app):
+        assert len(factory_calls) == 1
         pass
     assert owned.closed is True
 
@@ -861,6 +1428,120 @@ def test_app_closes_only_the_model_it_constructed(
     ):
         pass
     assert injected.closed is False
+
+
+def test_untrusted_peer_cannot_spoof_client_key_with_forwarded_for() -> None:
+    from workspace_agent import web
+
+    connection = SimpleNamespace(
+        client=SimpleNamespace(host="203.0.113.9"),
+        headers={"x-forwarded-for": "198.51.100.7"},
+    )
+    trusted = web._parse_trusted_proxy_cidrs("10.0.0.0/8")
+
+    assert web._client_key(connection, trusted) == "203.0.113.9"
+
+
+def test_trusted_proxy_keys_distinct_clients_and_walks_proxy_chain() -> None:
+    from workspace_agent import web
+
+    trusted = web._parse_trusted_proxy_cidrs(
+        "10.0.0.0/8, 2001:db8:1::/48"
+    )
+    first = SimpleNamespace(
+        client=SimpleNamespace(host="10.0.0.2"),
+        headers={"x-forwarded-for": "198.51.100.10"},
+    )
+    second = SimpleNamespace(
+        client=SimpleNamespace(host="10.0.0.2"),
+        headers={"x-forwarded-for": "198.51.100.11"},
+    )
+    chain = SimpleNamespace(
+        client=SimpleNamespace(host="2001:db8:1::2"),
+        headers={
+            "x-forwarded-for": "2001:db8:2::7, 10.0.0.9"
+        },
+    )
+
+    assert web._client_key(first, trusted) == "198.51.100.10"
+    assert web._client_key(second, trusted) == "198.51.100.11"
+    assert web._client_key(chain, trusted) == "2001:db8:2::7"
+
+
+@pytest.mark.parametrize(
+    "forwarded_for",
+    [
+        "198.51.100.10, malformed",
+        ",".join(["198.51.100.10"] * 21),
+        "198.51.100.10" + (" " * 2048),
+    ],
+)
+def test_malformed_or_oversized_forwarded_for_falls_back_to_peer(
+    forwarded_for: str,
+) -> None:
+    from workspace_agent import web
+
+    connection = SimpleNamespace(
+        client=SimpleNamespace(host="10.0.0.2"),
+        headers={"x-forwarded-for": forwarded_for},
+    )
+    trusted = web._parse_trusted_proxy_cidrs("10.0.0.0/8")
+
+    assert web._client_key(connection, trusted) == "10.0.0.2"
+
+
+def test_create_app_rejects_invalid_trusted_proxy_configuration(
+    tmp_path: Path,
+) -> None:
+    invalid = "10.0.0.0/8,secret-invalid-cidr"
+
+    with pytest.raises(
+        ValueError,
+        match="^trusted proxy configuration is invalid$",
+    ) as error:
+        create_app(
+            settings_for(tmp_path, trusted_proxy_cidrs=invalid),
+            model=FinalOnlyModel(),
+        )
+
+    assert invalid not in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_trusted_proxy_clients_receive_independent_reset_limits(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        settings_for(
+            tmp_path,
+            rate_limit_per_minute=1,
+            trusted_proxy_cidrs="10.0.0.0/8",
+        ),
+        model=FinalOnlyModel(),
+    )
+    transport = ASGITransport(app=app, client=("10.0.0.2", 41000))
+
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        first = await client.post(
+            "/api/reset",
+            headers={
+                "origin": "http://testserver",
+                "x-forwarded-for": "198.51.100.10",
+            },
+        )
+        second = await client.post(
+            "/api/reset",
+            headers={
+                "origin": "http://testserver",
+                "x-forwarded-for": "198.51.100.11",
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
 
 
 def test_sliding_window_limiter_expires_isolates_keys_and_bounds_memory() -> None:

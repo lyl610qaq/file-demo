@@ -1,3 +1,5 @@
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -26,11 +28,13 @@ def test_settings_normalize_paths_and_apply_run_defaults(
     assert settings.trace_root == tmp_path / "traces"
     assert settings.static_root == tmp_path / "static"
     assert settings.max_model_calls == 30
+    assert settings.max_run_seconds == 300.0
     assert settings.max_concurrent_runs == 1
     assert settings.max_read_bytes == 16384
     assert settings.max_write_bytes == 262144
     assert settings.request_timeout_seconds == 60.0
     assert settings.rate_limit_per_minute == 10
+    assert settings.trusted_proxy_cidrs == ""
 
 
 def test_settings_allow_an_empty_api_key(tmp_path: Path) -> None:
@@ -57,11 +61,39 @@ def test_settings_collapse_parent_segments_in_paths(
     assert settings.workspace_root == tmp_path / "canonical"
 
 
+def test_settings_preserve_a_runtime_root_link_for_security_validation(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "linked-root"
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0:
+            pytest.skip(created.stderr or created.stdout)
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+    try:
+        settings = Settings(seed_root=link)
+        assert settings.seed_root == link.absolute()
+    finally:
+        if os.path.lexists(link):
+            os.rmdir(link)
+
+
 @pytest.mark.parametrize(
     ("field_name", "invalid_value"),
     [
         ("max_model_calls", 0),
         ("max_model_calls", 101),
+        ("max_run_seconds", 0.049),
+        ("max_run_seconds", 3600.1),
         ("max_concurrent_runs", 0),
         ("max_concurrent_runs", 9),
         ("max_read_bytes", 1023),
@@ -87,6 +119,8 @@ def test_settings_reject_values_outside_limits(
     [
         ("max_model_calls", 1),
         ("max_model_calls", 100),
+        ("max_run_seconds", 0.05),
+        ("max_run_seconds", 3600.0),
         ("max_concurrent_runs", 1),
         ("max_concurrent_runs", 8),
         ("max_read_bytes", 1024),
@@ -106,3 +140,11 @@ def test_settings_accept_values_at_limit_boundaries(
     settings = Settings(**{field_name: boundary_value})
 
     assert getattr(settings, field_name) == boundary_value
+
+
+def test_settings_accept_comma_separated_trusted_proxy_cidrs() -> None:
+    settings = Settings(
+        trusted_proxy_cidrs="10.0.0.0/8, 2001:db8::/32",
+    )
+
+    assert settings.trusted_proxy_cidrs == "10.0.0.0/8, 2001:db8::/32"
