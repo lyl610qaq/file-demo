@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import threading
 from collections import deque
@@ -188,6 +189,7 @@ def test_index_assets_health_meta_tree_file_and_reset(tmp_path: Path) -> None:
         assert client.get("/api/meta").json() == {
             "model": "gpt-4.1-mini",
             "configured": True,
+            "max_run_seconds": 300.0,
         }
         assert client.get("/api/tree").json()["entries"][0]["path"] == "a.md"
         assert client.get("/api/file", params={"path": "a.md"}).json()[
@@ -198,6 +200,38 @@ def test_index_assets_health_meta_tree_file_and_reset(tmp_path: Path) -> None:
             "/api/file", params={"path": "seed.md"}
         ).status_code == 200
         assert client.get("/api/file", params={"path": "a.md"}).status_code == 404
+
+
+def test_html_static_and_api_responses_include_security_headers(
+    tmp_path: Path,
+) -> None:
+    static_root = Path("static").resolve()
+    app = create_app(
+        settings_for(tmp_path, static_root=static_root),
+        model=FinalOnlyModel(),
+    )
+
+    with TestClient(app) as client:
+        responses = (
+            client.get("/"),
+            client.get("/assets/app.js"),
+            client.get("/api/meta"),
+        )
+
+    required_csp = (
+        "default-src 'self'; script-src 'self'; style-src 'self'; "
+        "connect-src 'self' ws: wss:; img-src 'self' data:; "
+        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+        "form-action 'self'"
+    )
+    for response in responses:
+        assert response.status_code == 200
+        assert response.headers["content-security-policy"] == required_csp
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["referrer-policy"] == "no-referrer"
+        assert "camera=()" in response.headers["permissions-policy"]
+        assert "microphone=()" in response.headers["permissions-policy"]
+        assert "geolocation=()" in response.headers["permissions-policy"]
 
 
 def test_tree_exposes_authenticated_pagination(tmp_path: Path) -> None:
@@ -1825,6 +1859,11 @@ def test_frontend_shell_exposes_three_pane_agent_controls(
     assert 'role="tree"' not in html
     assert 'role="treeitem"' not in html
     assert (
+        'id="file-tree" class="file-tree" '
+        'aria-label="工作区文件" tabindex="0"'
+        in html
+    )
+    assert (
         'class="active" data-view="task" aria-current="page"'
         in html
     )
@@ -1866,6 +1905,24 @@ def test_frontend_assets_are_served_and_use_safe_browser_primitives(
         "run_failed",
     ):
         assert f'"{event_type}"' in script
+
+
+def test_frontend_uses_local_fixed_lucide_asset(tmp_path: Path) -> None:
+    static_root = Path("static").resolve()
+    app = create_app(
+        settings_for(tmp_path, static_root=static_root),
+        model=FinalOnlyModel(),
+    )
+
+    with TestClient(app) as client:
+        html = client.get("/").text
+        vendor = client.get("/assets/vendor/lucide.min.js")
+
+    assert 'src="/assets/vendor/lucide.min.js"' in html
+    assert "unpkg.com" not in html
+    assert vendor.status_code == 200
+    assert len(vendor.content) > 100_000
+    assert b"lucide" in vendor.content.lower()
 
 
 def test_frontend_uses_native_tree_buttons_and_initializes_mobile_pane() -> (
@@ -1917,7 +1974,24 @@ def test_frontend_styles_define_dense_responsive_and_reduced_motion_views() -> (
     assert "[data-pane]" in styles
     assert "letter-spacing: 0" in styles
     assert "border-radius: 8px" in styles or "border-radius: 6px" in styles
+    assert "outline: 3px solid #0b6b63" in styles
     assert "gradient" not in styles.lower()
+
+
+def test_frontend_node_runtime_contracts() -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is required for frontend runtime tests")
+
+    completed = subprocess.run(
+        [node, "--test", "tests/frontend.test.mjs"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 def test_sliding_window_limiter_expires_isolates_keys_and_bounds_memory() -> None:

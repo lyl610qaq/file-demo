@@ -51,7 +51,7 @@ button:focus-visible,
 a:focus-visible,
 textarea:focus-visible,
 [tabindex]:focus-visible {
-  outline: 3px solid #8bc9c1;
+  outline: 3px solid #0b6b63;
   outline-offset: 2px;
 }
 

@@ -2,14 +2,24 @@
   "use strict";
 
   const TREE_PAGE_LIMIT = 200;
-  const TREE_AUTO_PAGES = 20;
+  const TREE_INITIAL_PAGES = 20;
+  const TREE_MAX_PAGES = 25;
+  const TREE_MAX_ENTRIES = 5000;
+  const TREE_MAX_JSON_CHARS = 2 * 1024 * 1024;
   const FILE_PAGE_BYTES = 65536;
-  const FILE_PREVIEW_CHARS = 262144;
+  const FILE_MAX_PAGES = 128;
+  const FILE_MAX_PREVIEW_CHARS = 1024 * 1024;
+  const MAX_JSON_RESPONSE_CHARS = 2 * 1024 * 1024;
+  const MAX_SOCKET_EVENT_CHARS = 256 * 1024;
+  const MAX_EVENT_STRING_CHARS = 64 * 1024;
+  const MAX_TOOL_EVENT_CHARS = 64 * 1024;
   const REQUEST_TIMEOUT_MS = 15000;
   const SOCKET_CONNECT_TIMEOUT_MS = 10000;
+  const RUN_WATCHDOG_BUFFER_MS = 5000;
+  const RUN_WATCHDOG_MIN_MS = 6000;
+  const RUN_WATCHDOG_MAX_MS = 3605000;
   const API_TREE = "/api/tree";
   const API_FILE = "/api/file";
-  const TERMINAL_EVENTS = new Set(["run_completed", "run_failed"]);
   const EVENT_TYPES = new Set([
     "run_started",
     "model_call_started",
@@ -23,16 +33,33 @@
 
   const state = {
     socket: null,
+    connectionTimer: null,
+    runWatchdog: null,
     runId: null,
+    activeRunId: null,
     steps: 0,
     running: false,
     resetting: false,
     modelConfigured: false,
+    maxRunSeconds: null,
     terminalSeen: false,
+    lastModelCall: -1,
+    lastUsageModelCalls: -1,
+    lastToolStep: -1,
+    activeToolStep: null,
+    activeToolName: null,
     treeEntries: [],
     treeCursor: null,
+    treeSeenCursors: new Set(),
+    treePages: 0,
+    treeJsonChars: 0,
+    treeLoading: false,
+    treeLimitReached: false,
     collapsedPaths: new Set(),
     selectedPath: null,
+    fileController: null,
+    fileRequestToken: 0,
+    lastTreeFocusPath: null,
     activePane: "task",
     treeGroupSequence: 0,
     usage: {
@@ -46,8 +73,16 @@
   const byId = (id) => document.getElementById(id);
   const mobileLayout = window.matchMedia("(max-width: 860px)");
 
-  function isRecord(value) {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
+  function isPlainObject(value) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      return false;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+  }
+
+  function isNonnegativeInteger(value) {
+    return Number.isSafeInteger(value) && value >= 0;
   }
 
   function safeString(value, fallback = "") {
@@ -55,7 +90,7 @@
   }
 
   function safeCount(value) {
-    return Number.isSafeInteger(value) && value >= 0 ? String(value) : "不可用";
+    return isNonnegativeInteger(value) ? String(value) : "不可用";
   }
 
   function setText(id, value) {
@@ -63,6 +98,13 @@
     if (node) {
       node.textContent = value;
     }
+  }
+
+  function userError(code, message) {
+    const error = new Error(code);
+    error.code = code;
+    error.userMessage = message;
+    return error;
   }
 
   function setStatus(text, kind) {
@@ -81,7 +123,8 @@
     const busy = state.running || state.resetting;
     byId("run-button").disabled = busy || !state.modelConfigured;
     byId("task-input").disabled = busy;
-    byId("refresh-button").disabled = busy;
+    byId("refresh-button").disabled = busy || state.treeLoading;
+    byId("tree-load-more").disabled = busy || state.treeLoading;
     byId("reset-button").disabled = busy;
     byId("confirm-reset").disabled = busy;
   }
@@ -141,7 +184,9 @@
       return "操作过于频繁，请稍后重试";
     }
     if (status === 404) {
-      return context === "file" ? "文件不存在或已被移动" : "请求的内容不存在";
+      return context === "file"
+        ? "文件不存在或已被移动"
+        : "请求的内容不存在";
     }
     if (status === 415) {
       return "该文件不是可预览的文本";
@@ -157,65 +202,101 @@
 
   async function fetchJson(path, options = {}, context = "request") {
     const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const externalSignal = options.signal;
+    let timedOut = false;
+    const forwardAbort = () => controller.abort();
+    if (externalSignal?.aborted) {
+      controller.abort();
+    } else {
+      externalSignal?.addEventListener("abort", forwardAbort, { once: true });
+    }
+    const timer = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, REQUEST_TIMEOUT_MS);
+    const requestOptions = { ...options };
+    delete requestOptions.signal;
+
     try {
       const response = await fetch(path, {
         credentials: "same-origin",
-        ...options,
+        ...requestOptions,
         headers: {
           Accept: "application/json",
-          ...(options.headers || {}),
+          ...(requestOptions.headers || {}),
         },
         signal: controller.signal,
       });
+      const raw = await response.text();
+      if (raw.length > MAX_JSON_RESPONSE_CHARS) {
+        throw userError("RESPONSE_TOO_LARGE", "响应内容过大");
+      }
+
       let payload = null;
       try {
-        payload = await response.json();
+        payload = JSON.parse(raw);
       } catch {
         payload = null;
       }
       if (!response.ok) {
-        const detail = isRecord(payload) && isRecord(payload.detail) ? payload.detail : {};
-        const error = new Error("request failed");
-        error.userMessage = apiMessage(response.status, safeString(detail.error_code), context);
+        const detail =
+          isPlainObject(payload) && isPlainObject(payload.detail)
+            ? payload.detail
+            : {};
+        const error = userError(
+          "REQUEST_FAILED",
+          apiMessage(
+            response.status,
+            safeString(detail.error_code),
+            context,
+          ),
+        );
         error.status = response.status;
         throw error;
       }
-      if (!isRecord(payload)) {
-        const error = new Error("invalid response");
-        error.userMessage = "服务返回了无法识别的数据";
-        throw error;
+      if (!isPlainObject(payload)) {
+        throw userError(
+          "INVALID_RESPONSE",
+          "服务返回了无法识别的数据",
+        );
       }
-      return payload;
+      return { data: payload, textLength: raw.length };
     } catch (error) {
       if (error && error.name === "AbortError") {
-        const timeout = new Error("request timed out");
-        timeout.userMessage = "请求超时，请稍后重试";
-        throw timeout;
+        if (!timedOut && externalSignal?.aborted) {
+          throw error;
+        }
+        throw userError("REQUEST_TIMEOUT", "请求超时，请稍后重试");
       }
       if (error && typeof error.userMessage === "string") {
         throw error;
       }
-      const network = new Error("network failed");
-      network.userMessage = "无法连接服务，请检查网络后重试";
-      throw network;
+      throw userError(
+        "NETWORK_FAILED",
+        "无法连接服务，请检查网络后重试",
+      );
     } finally {
       window.clearTimeout(timer);
+      externalSignal?.removeEventListener?.("abort", forwardAbort);
     }
   }
 
   function validateTreePayload(payload) {
     if (
+      !isPlainObject(payload) ||
       !Array.isArray(payload.entries) ||
       typeof payload.has_more !== "boolean" ||
-      !(payload.next_cursor === null || typeof payload.next_cursor === "string")
+      !(
+        payload.next_cursor === null ||
+        typeof payload.next_cursor === "string"
+      )
     ) {
       return null;
     }
     const entries = [];
     for (const entry of payload.entries) {
       if (
-        !isRecord(entry) ||
+        !isPlainObject(entry) ||
         typeof entry.path !== "string" ||
         !entry.path ||
         !["file", "directory"].includes(entry.type)
@@ -225,16 +306,16 @@
       entries.push({
         path: entry.path,
         type: entry.type,
-        size: Number.isSafeInteger(entry.size) && entry.size >= 0 ? entry.size : null,
+        size:
+          isNonnegativeInteger(entry.size)
+            ? entry.size
+            : null,
       });
-    }
-    if (payload.has_more && !payload.next_cursor) {
-      return null;
     }
     return {
       entries,
-      has_more: payload.has_more,
-      next_cursor: payload.next_cursor,
+      hasMore: payload.has_more,
+      nextCursor: payload.next_cursor,
     };
   }
 
@@ -250,59 +331,185 @@
     return `${API_TREE}?${params.toString()}`;
   }
 
+  function invalidateFileRequest(options = {}) {
+    state.fileRequestToken += 1;
+    if (state.fileController) {
+      state.fileController.abort();
+      state.fileController = null;
+    }
+    if (options.clearSelection === true) {
+      state.selectedPath = null;
+    }
+  }
+
+  function resetTreePagination() {
+    state.treeEntries = [];
+    state.treeCursor = null;
+    state.treeSeenCursors = new Set();
+    state.treePages = 0;
+    state.treeJsonChars = 0;
+    state.treeLimitReached = false;
+  }
+
+  function treePaginationError() {
+    return userError("TREE_PAGINATION", "文件列表分页异常");
+  }
+
   async function loadTree(options = {}) {
     const append = options.append === true;
+    if (state.treeLoading || (append && !state.treeCursor)) {
+      return;
+    }
+    if (!append && options.keepFileRequest !== true) {
+      invalidateFileRequest();
+      if (state.selectedPath) {
+        setText("viewer-meta", "预览已停止");
+      }
+    }
+
+    state.treeLoading = true;
+    setControlsBusy();
     if (!append) {
-      state.treeEntries = [];
-      state.treeCursor = null;
+      resetTreePagination();
       setText("tree-status", "正在读取文件");
       byId("tree-load-more").hidden = true;
     }
 
-    let cursor = append ? state.treeCursor : null;
-    let pages = 0;
-    const incoming = [];
+    const pageBudget = append
+      ? TREE_MAX_PAGES - state.treePages
+      : Math.min(TREE_INITIAL_PAGES, TREE_MAX_PAGES);
+    let pagesLoaded = 0;
+    let limitMessage = "";
+
     try {
-      do {
-        const payload = validateTreePayload(await fetchJson(treeUrl(cursor), {}, "tree"));
-        if (!payload) {
-          throw Object.assign(new Error("invalid tree"), {
-            userMessage: "文件列表格式无法识别",
-          });
-        }
-        incoming.push(...payload.entries);
-        cursor = payload.next_cursor;
-        pages += 1;
-        if (!payload.has_more) {
-          cursor = null;
+      while (
+        pagesLoaded < pageBudget &&
+        state.treePages < TREE_MAX_PAGES &&
+        state.treeEntries.length < TREE_MAX_ENTRIES
+      ) {
+        const currentCursor = state.treeCursor;
+        const response = await fetchJson(
+          treeUrl(currentCursor),
+          {},
+          "tree",
+        );
+        if (
+          state.treeJsonChars + response.textLength >
+          TREE_MAX_JSON_CHARS
+        ) {
+          state.treeLimitReached = true;
+          state.treeCursor = null;
+          limitMessage = "文件列表响应过大，仅显示已加载内容";
           break;
         }
-      } while (pages < TREE_AUTO_PAGES);
+        state.treeJsonChars += response.textLength;
 
-      const paths = new Set(state.treeEntries.map((entry) => entry.path));
-      for (const entry of incoming) {
-        if (!paths.has(entry.path)) {
-          state.treeEntries.push(entry);
-          paths.add(entry.path);
+        const page = validateTreePayload(response.data);
+        if (!page) {
+          throw userError(
+            "INVALID_TREE",
+            "文件列表格式无法识别",
+          );
+        }
+        if (page.hasMore) {
+          if (
+            page.entries.length === 0 ||
+            typeof page.nextCursor !== "string" ||
+            !page.nextCursor ||
+            page.nextCursor === currentCursor ||
+            state.treeSeenCursors.has(page.nextCursor)
+          ) {
+            throw treePaginationError();
+          }
+        } else if (page.nextCursor !== null) {
+          throw treePaginationError();
+        }
+
+        const paths = new Set(
+          state.treeEntries.map((entry) => entry.path),
+        );
+        const freshEntries = page.entries.filter(
+          (entry) => !paths.has(entry.path),
+        );
+        if (page.entries.length > 0 && freshEntries.length === 0) {
+          throw treePaginationError();
+        }
+
+        const remaining = TREE_MAX_ENTRIES - state.treeEntries.length;
+        state.treeEntries.push(...freshEntries.slice(0, remaining));
+        state.treePages += 1;
+        pagesLoaded += 1;
+
+        if (freshEntries.length > remaining) {
+          state.treeLimitReached = true;
+          state.treeCursor = null;
+          limitMessage = `文件列表过大，仅显示前 ${TREE_MAX_ENTRIES} 项`;
+          break;
+        }
+        if (!page.hasMore) {
+          state.treeCursor = null;
+          break;
+        }
+
+        state.treeSeenCursors.add(page.nextCursor);
+        state.treeCursor = page.nextCursor;
+        if (
+          state.treeEntries.length >= TREE_MAX_ENTRIES ||
+          state.treePages >= TREE_MAX_PAGES
+        ) {
+          state.treeLimitReached = true;
+          state.treeCursor = null;
+          limitMessage =
+            state.treeEntries.length >= TREE_MAX_ENTRIES
+              ? `文件列表过大，仅显示前 ${TREE_MAX_ENTRIES} 项`
+              : `文件列表页数过多，仅显示前 ${state.treeEntries.length} 项`;
+          break;
         }
       }
-      state.treeCursor = cursor;
-      state.treeEntries.sort((left, right) => left.path.localeCompare(right.path, "zh-CN"));
+
+      state.treeEntries.sort((left, right) =>
+        left.path.localeCompare(right.path, "zh-CN"),
+      );
       renderTree();
       setText("tree-summary", `${state.treeEntries.length} 项`);
-      setText("tree-status", state.treeEntries.length ? "" : "工作区为空");
-      byId("tree-load-more").hidden = state.treeCursor === null;
+      if (limitMessage) {
+        setText("tree-status", limitMessage);
+      } else if (state.treeEntries.length === 0) {
+        setText("tree-status", "工作区为空");
+      } else if (state.treeCursor) {
+        setText("tree-status", "可继续加载更多文件");
+      } else {
+        setText("tree-status", "");
+      }
     } catch (error) {
-      setText("tree-status", error.userMessage || "文件列表加载失败");
-      if (!append) {
+      if (error && error.name === "AbortError") {
+        return;
+      }
+      state.treeCursor = null;
+      state.treeLimitReached = true;
+      setText(
+        "tree-status",
+        error.userMessage || "文件列表加载失败",
+      );
+      if (!append && state.treeEntries.length === 0) {
         byId("file-tree").replaceChildren();
         setText("tree-summary", "读取失败");
       }
+    } finally {
+      state.treeLoading = false;
+      byId("tree-load-more").hidden =
+        !state.treeCursor || state.treeLimitReached;
+      setControlsBusy();
     }
   }
 
   function buildTree(entries) {
-    const root = { name: "", path: "", type: "directory", children: new Map() };
+    const root = {
+      name: "",
+      path: "",
+      type: "directory",
+      children: new Map(),
+    };
     for (const entry of entries) {
       const segments = entry.path.split("/").filter(Boolean);
       let parent = root;
@@ -338,7 +545,7 @@
     });
   }
 
-  function renderTreeGroup(node) {
+  function renderTreeGroup(node, focusTargets) {
     const group = document.createElement("ul");
     group.className = "tree-group";
 
@@ -349,13 +556,24 @@
       button.type = "button";
       button.className = "file-row";
       button.title = child.path;
+      button.dataset.treePath = child.path;
+      button.addEventListener("focus", () => {
+        state.lastTreeFocusPath = child.path;
+      });
+      focusTargets.set(child.path, button);
 
       const chevron = document.createElement("span");
       chevron.className = "tree-chevron";
       chevron.textContent = child.type === "directory" ? "▾" : "";
       chevron.setAttribute("aria-hidden", "true");
       button.append(chevron);
-      button.append(createIcon(child.type === "directory" ? "folder" : fileIcon(child.path)));
+      button.append(
+        createIcon(
+          child.type === "directory"
+            ? "folder"
+            : fileIcon(child.path),
+        ),
+      );
 
       const label = document.createElement("span");
       label.className = "file-label";
@@ -367,7 +585,10 @@
         button.classList.add("directory-button");
         button.setAttribute("aria-expanded", collapsed ? "false" : "true");
         chevron.textContent = collapsed ? "›" : "▾";
-        button.setAttribute("aria-label", `${collapsed ? "展开" : "折叠"}目录 ${child.name}`);
+        button.setAttribute(
+          "aria-label",
+          `${collapsed ? "展开" : "折叠"}目录 ${child.name}`,
+        );
         button.addEventListener("click", () => {
           if (state.collapsedPaths.has(child.path)) {
             state.collapsedPaths.delete(child.path);
@@ -377,7 +598,10 @@
           renderTree();
         });
       } else {
-        button.setAttribute("aria-label", `预览文件 ${child.name}`);
+        button.setAttribute(
+          "aria-label",
+          `预览文件 ${child.name}`,
+        );
         if (state.selectedPath === child.path) {
           button.classList.add("active");
         }
@@ -386,7 +610,7 @@
 
       item.append(button);
       if (child.type === "directory") {
-        const childGroup = renderTreeGroup(child);
+        const childGroup = renderTreeGroup(child, focusTargets);
         state.treeGroupSequence += 1;
         childGroup.id = `tree-group-${state.treeGroupSequence}`;
         button.setAttribute("aria-controls", childGroup.id);
@@ -405,43 +629,89 @@
     if (lower.endsWith(".csv") || lower.endsWith(".tsv")) {
       return "table";
     }
-    if (lower.endsWith(".json") || lower.endsWith(".js") || lower.endsWith(".py")) {
+    if (
+      lower.endsWith(".json") ||
+      lower.endsWith(".js") ||
+      lower.endsWith(".py")
+    ) {
       return "file-code";
     }
     return "file";
   }
 
+  function nearestFocusTarget(path, targets) {
+    let candidate = path;
+    while (candidate) {
+      if (targets.has(candidate)) {
+        return targets.get(candidate);
+      }
+      const separator = candidate.lastIndexOf("/");
+      candidate = separator >= 0 ? candidate.slice(0, separator) : "";
+    }
+    return null;
+  }
+
   function renderTree() {
     const container = byId("file-tree");
+    const focusedPath =
+      document.activeElement?.dataset?.treePath ||
+      state.lastTreeFocusPath;
     container.replaceChildren();
     state.treeGroupSequence = 0;
+    const focusTargets = new Map();
     const tree = buildTree(state.treeEntries);
-    container.append(renderTreeGroup(tree));
+    container.append(renderTreeGroup(tree, focusTargets));
     refreshIcons();
+
+    if (focusedPath) {
+      const target = nearestFocusTarget(focusedPath, focusTargets);
+      (target || container).focus();
+    }
   }
 
   function validateFilePayload(payload) {
     if (
+      !isPlainObject(payload) ||
       typeof payload.path !== "string" ||
       typeof payload.content !== "string" ||
+      !isNonnegativeInteger(payload.offset) ||
+      !isNonnegativeInteger(payload.next_offset) ||
       typeof payload.has_more !== "boolean" ||
-      !(payload.next_cursor === null || typeof payload.next_cursor === "string")
+      !(
+        payload.next_cursor === null ||
+        typeof payload.next_cursor === "string"
+      )
     ) {
-      return null;
-    }
-    if (payload.has_more && !payload.next_cursor) {
       return null;
     }
     return {
       path: payload.path,
       content: payload.content,
-      has_more: payload.has_more,
-      next_cursor: payload.next_cursor,
+      offset: payload.offset,
+      nextOffset: payload.next_offset,
+      hasMore: payload.has_more,
+      nextCursor: payload.next_cursor,
       encoding: safeString(payload.encoding, "文本"),
     };
   }
 
+  function fileRequestIsCurrent(token, path, pagePath = path) {
+    return (
+      token === state.fileRequestToken &&
+      state.selectedPath === path &&
+      pagePath === path
+    );
+  }
+
+  function filePaginationError() {
+    return userError("FILE_PAGINATION", "文件分页无进展");
+  }
+
   async function openFile(path) {
+    invalidateFileRequest();
+    const token = state.fileRequestToken;
+    const controller = new AbortController();
+    state.fileController = controller;
     state.selectedPath = path;
     renderTree();
     setText("viewer-path", path);
@@ -450,32 +720,81 @@
     activatePane("task");
 
     let cursor = null;
+    let expectedOffset = 0;
     let content = "";
-    let hasMore = false;
     let encoding = "文本";
+    let truncated = false;
+    const seenCursors = new Set();
+
     try {
-      do {
+      for (let pageNumber = 0; pageNumber < FILE_MAX_PAGES; pageNumber += 1) {
         const params = new URLSearchParams({
           path,
+          offset: String(expectedOffset),
           limit: String(FILE_PAGE_BYTES),
         });
         if (cursor) {
           params.set("cursor", cursor);
         }
-        const page = validateFilePayload(
-          await fetchJson(`${API_FILE}?${params.toString()}`, {}, "file"),
+        const response = await fetchJson(
+          `${API_FILE}?${params.toString()}`,
+          { signal: controller.signal },
+          "file",
         );
-        if (!page) {
-          throw Object.assign(new Error("invalid file"), {
-            userMessage: "文件内容格式无法识别",
-          });
+        if (!fileRequestIsCurrent(token, path)) {
+          return;
+        }
+        const page = validateFilePayload(response.data);
+        if (
+          !page ||
+          !fileRequestIsCurrent(token, path, page?.path) ||
+          page.offset !== expectedOffset ||
+          page.nextOffset < page.offset
+        ) {
+          throw filePaginationError();
+        }
+        if (page.hasMore) {
+          if (
+            page.content.length === 0 ||
+            page.nextOffset <= page.offset ||
+            typeof page.nextCursor !== "string" ||
+            !page.nextCursor ||
+            page.nextCursor === cursor ||
+            seenCursors.has(page.nextCursor)
+          ) {
+            throw filePaginationError();
+          }
+        } else if (page.nextCursor !== null) {
+          throw filePaginationError();
+        }
+
+        encoding = page.encoding;
+        const remaining = FILE_MAX_PREVIEW_CHARS - content.length;
+        if (page.content.length > remaining) {
+          content += page.content.slice(0, remaining);
+          truncated = true;
+          break;
         }
         content += page.content;
-        cursor = page.next_cursor;
-        hasMore = page.has_more;
-        encoding = page.encoding;
-      } while (hasMore && cursor && content.length < FILE_PREVIEW_CHARS);
+        expectedOffset = page.nextOffset;
 
+        if (!page.hasMore) {
+          break;
+        }
+        seenCursors.add(page.nextCursor);
+        cursor = page.nextCursor;
+        if (
+          content.length >= FILE_MAX_PREVIEW_CHARS ||
+          pageNumber + 1 >= FILE_MAX_PAGES
+        ) {
+          truncated = true;
+          break;
+        }
+      }
+
+      if (!fileRequestIsCurrent(token, path)) {
+        return;
+      }
       if (!content) {
         setText("file-content", "空文件");
         setText("viewer-meta", encoding);
@@ -483,54 +802,305 @@
         setText("file-content", content);
         setText(
           "viewer-meta",
-          hasMore ? `${encoding} · 内容较长，已显示前 ${content.length} 个字符` : `${encoding} · ${content.length} 个字符`,
+          truncated
+            ? `${encoding} · 内容过大，仅显示前 ${content.length} 个字符`
+            : `${encoding} · ${content.length} 个字符`,
         );
       }
     } catch (error) {
-      setText("file-content", error.userMessage || "文件预览失败");
+      if (error && error.name === "AbortError") {
+        return;
+      }
+      if (!fileRequestIsCurrent(token, path)) {
+        return;
+      }
+      setText(
+        "file-content",
+        error.userMessage || "文件预览失败",
+      );
       setText("viewer-meta", "读取失败");
+    } finally {
+      if (token === state.fileRequestToken) {
+        state.fileController = null;
+      }
     }
+  }
+
+  function resetProtocolState() {
+    state.activeRunId = null;
+    state.lastModelCall = -1;
+    state.lastUsageModelCalls = -1;
+    state.lastToolStep = -1;
+    state.activeToolStep = null;
+    state.activeToolName = null;
   }
 
   function resetTraceView() {
     state.steps = 0;
     state.terminalSeen = false;
+    resetProtocolState();
     byId("trace-list").replaceChildren();
     setText("step-count", "0");
     byId("trace-empty").hidden = false;
   }
 
-  function eventIsValid(event) {
-    if (!isRecord(event) || !EVENT_TYPES.has(event.type)) {
+  function hasExactKeys(value, keys) {
+    if (!isPlainObject(value)) {
       return false;
     }
+    const actual = Object.keys(value).sort();
+    const expected = [...keys].sort();
+    return (
+      actual.length === expected.length &&
+      actual.every((key, index) => key === expected[index])
+    );
+  }
+
+  function validRunId(value) {
+    return (
+      typeof value === "string" &&
+      /^[A-Za-z0-9-]{1,128}$/.test(value)
+    );
+  }
+
+  function validBoundedString(value, maximum = MAX_EVENT_STRING_CHARS) {
+    return typeof value === "string" && value.length <= maximum;
+  }
+
+  function validUsage(value) {
     if (
-      event.run_id !== undefined &&
-      (typeof event.run_id !== "string" || !/^[A-Za-z0-9-]{1,128}$/.test(event.run_id))
+      !hasExactKeys(value, [
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+      ])
     ) {
       return false;
     }
-    if (event.type === "usage_updated") {
-      return Number.isSafeInteger(event.model_calls) && isRecord(event.usage);
+    return [
+      value.prompt_tokens,
+      value.completion_tokens,
+      value.total_tokens,
+    ].every((token) => token === null || isNonnegativeInteger(token));
+  }
+
+  function usageIsMonotonic(next) {
+    const pairs = [
+      [state.usage.promptTokens, next.prompt_tokens],
+      [state.usage.completionTokens, next.completion_tokens],
+      [state.usage.totalTokens, next.total_tokens],
+    ];
+    return pairs.every(([previous, current]) => {
+      if (previous === null) {
+        return current === null;
+      }
+      if (current === null) {
+        return true;
+      }
+      return isNonnegativeInteger(previous) && current >= previous;
+    });
+  }
+
+  function validJsonValue(value, depth = 0, budget = { nodes: 0 }) {
+    budget.nodes += 1;
+    if (budget.nodes > 256 || depth > 5) {
+      return false;
     }
-    if (event.type === "assistant_message") {
-      return typeof event.content === "string";
+    if (value === null || typeof value === "boolean") {
+      return true;
     }
-    if (event.type === "tool_started") {
-      return Number.isSafeInteger(event.step) && typeof event.tool === "string" && isRecord(event.args);
+    if (typeof value === "string") {
+      return value.length <= 8192;
     }
-    if (event.type === "tool_finished") {
+    if (typeof value === "number") {
+      return Number.isFinite(value);
+    }
+    if (Array.isArray(value)) {
       return (
-        Number.isSafeInteger(event.step) &&
-        typeof event.tool === "string" &&
-        typeof event.ok === "boolean" &&
-        typeof event.result_summary === "string"
+        value.length <= 64 &&
+        value.every((item) => validJsonValue(item, depth + 1, budget))
       );
     }
-    if (TERMINAL_EVENTS.has(event.type)) {
-      return typeof event.message === "string";
+    if (!isPlainObject(value) || Object.keys(value).length > 32) {
+      return false;
     }
-    return true;
+    return Object.values(value).every((item) =>
+      validJsonValue(item, depth + 1, budget),
+    );
+  }
+
+  function validToolArguments(value) {
+    if (!isPlainObject(value) || !validJsonValue(value)) {
+      return false;
+    }
+    try {
+      return JSON.stringify(value).length <= MAX_TOOL_EVENT_CHARS;
+    } catch {
+      return false;
+    }
+  }
+
+  function eventBelongsToRun(event) {
+    return (
+      state.activeRunId !== null &&
+      event.run_id === state.activeRunId
+    );
+  }
+
+  function validateRunEvent(event) {
+    if (
+      !isPlainObject(event) ||
+      !EVENT_TYPES.has(event.type)
+    ) {
+      return false;
+    }
+
+    if (event.type === "run_started") {
+      if (
+        !hasExactKeys(event, ["type", "run_id"]) ||
+        !validRunId(event.run_id) ||
+        state.activeRunId !== null
+      ) {
+        return false;
+      }
+      state.activeRunId = event.run_id;
+      return true;
+    }
+
+    if (event.type === "run_failed" && event.run_id === undefined) {
+      return (
+        hasExactKeys(event, ["type", "message"]) &&
+        validBoundedString(event.message)
+      );
+    }
+
+    if (!validRunId(event.run_id) || !eventBelongsToRun(event)) {
+      return false;
+    }
+
+    if (event.type === "model_call_started") {
+      if (
+        !hasExactKeys(event, ["type", "run_id", "call"]) ||
+        !isNonnegativeInteger(event.call) ||
+        event.call <= state.lastModelCall
+      ) {
+        return false;
+      }
+      state.lastModelCall = event.call;
+      return true;
+    }
+
+    if (event.type === "usage_updated") {
+      if (
+        !hasExactKeys(event, [
+          "type",
+          "run_id",
+          "model_calls",
+          "usage",
+        ]) ||
+        !isNonnegativeInteger(event.model_calls) ||
+        event.model_calls < state.lastModelCall ||
+        event.model_calls <= state.lastUsageModelCalls ||
+        !validUsage(event.usage) ||
+        !usageIsMonotonic(event.usage)
+      ) {
+        return false;
+      }
+      state.lastUsageModelCalls = event.model_calls;
+      return true;
+    }
+
+    if (event.type === "tool_started") {
+      if (
+        !hasExactKeys(event, [
+          "type",
+          "run_id",
+          "step",
+          "tool",
+          "args",
+        ]) ||
+        !isNonnegativeInteger(event.step) ||
+        event.step <= state.lastToolStep ||
+        state.activeToolStep !== null ||
+        !validBoundedString(event.tool, 128) ||
+        !event.tool ||
+        !validToolArguments(event.args)
+      ) {
+        return false;
+      }
+      state.activeToolStep = event.step;
+      state.activeToolName = event.tool;
+      return true;
+    }
+
+    if (event.type === "tool_finished") {
+      if (
+        !hasExactKeys(event, [
+          "type",
+          "run_id",
+          "step",
+          "tool",
+          "ok",
+          "result_summary",
+        ]) ||
+        event.step !== state.activeToolStep ||
+        event.tool !== state.activeToolName ||
+        typeof event.ok !== "boolean" ||
+        !validBoundedString(event.result_summary)
+      ) {
+        return false;
+      }
+      state.lastToolStep = event.step;
+      state.activeToolStep = null;
+      state.activeToolName = null;
+      return true;
+    }
+
+    if (event.type === "assistant_message") {
+      return (
+        hasExactKeys(event, ["type", "run_id", "content"]) &&
+        validBoundedString(event.content)
+      );
+    }
+
+    if (event.type === "run_completed") {
+      return (
+        hasExactKeys(event, [
+          "type",
+          "run_id",
+          "status",
+          "message",
+          "model_calls",
+          "usage",
+        ]) &&
+        event.status === "completed" &&
+        validBoundedString(event.message) &&
+        isNonnegativeInteger(event.model_calls) &&
+        event.model_calls >= state.lastModelCall &&
+        event.model_calls >= state.lastUsageModelCalls &&
+        validUsage(event.usage) &&
+        usageIsMonotonic(event.usage) &&
+        state.activeToolStep === null
+      );
+    }
+
+    return (
+      hasExactKeys(event, [
+        "type",
+        "run_id",
+        "status",
+        "message",
+        "model_calls",
+        "usage",
+      ]) &&
+      event.status === "failed" &&
+      validBoundedString(event.message) &&
+      isNonnegativeInteger(event.model_calls) &&
+      event.model_calls >= state.lastModelCall &&
+      event.model_calls >= state.lastUsageModelCalls &&
+      validUsage(event.usage) &&
+      usageIsMonotonic(event.usage)
+    );
   }
 
   function traceLabel(event) {
@@ -550,13 +1120,7 @@
       return `第 ${safeCount(event.call)} 次调用`;
     }
     if (event.type === "tool_started") {
-      let args = "";
-      try {
-        args = JSON.stringify(event.args);
-      } catch {
-        args = "{}";
-      }
-      return `${event.tool} ${args}`;
+      return `${event.tool} ${JSON.stringify(event.args)}`;
     }
     if (event.type === "tool_finished") {
       return `${event.tool} · ${event.result_summary}`;
@@ -573,13 +1137,14 @@
   function appendStep(event) {
     const item = document.createElement("li");
     item.className = "trace-item";
-    item.dataset.kind = event.type === "run_failed"
-      ? "error"
-      : event.type.startsWith("tool_")
-        ? "tool"
-        : event.type === "model_call_started"
-          ? "warning"
-          : "model";
+    item.dataset.kind =
+      event.type === "run_failed"
+        ? "error"
+        : event.type.startsWith("tool_")
+          ? "tool"
+          : event.type === "model_call_started"
+            ? "warning"
+            : "model";
 
     const title = document.createElement("strong");
     title.textContent = traceLabel(event);
@@ -630,20 +1195,55 @@
     link.setAttribute("aria-disabled", "true");
   }
 
+  function clearConnectionTimer() {
+    if (state.connectionTimer !== null) {
+      window.clearTimeout(state.connectionTimer);
+      state.connectionTimer = null;
+    }
+  }
+
+  function clearRunWatchdog() {
+    if (state.runWatchdog !== null) {
+      window.clearTimeout(state.runWatchdog);
+      state.runWatchdog = null;
+    }
+  }
+
+  function clearRunTimers() {
+    clearConnectionTimer();
+    clearRunWatchdog();
+  }
+
   function finishRun(message, failed) {
     if (!state.running) {
       return;
     }
+    clearRunTimers();
     state.running = false;
     setControlsBusy();
-    setStatus(failed ? message : "完成", failed ? "failed" : "completed");
+    setStatus(
+      failed ? message : "完成",
+      failed ? "failed" : "completed",
+    );
     setText("reply-state", failed ? "未完成" : "已完成");
-    loadTree();
+    void loadTree();
+  }
+
+  function failProtocol(socket) {
+    if (!state.running || state.terminalSeen) {
+      return;
+    }
+    state.terminalSeen = true;
+    clearRunTimers();
+    setText("assistant-output", "运行协议错误");
+    appendStep({ type: "run_failed", message: "Run failed" });
+    finishRun("运行协议错误", true);
+    socket.close(1002, "protocol-error");
   }
 
   function handleEvent(event) {
-    if (!eventIsValid(event) || state.terminalSeen) {
-      return;
+    if (state.terminalSeen || !validateRunEvent(event)) {
+      return false;
     }
     if (event.run_id) {
       enableTraceDownload(event.run_id);
@@ -658,13 +1258,19 @@
       };
       setText("usage-calls", safeCount(state.usage.modelCalls));
       setText("usage-prompt", safeCount(state.usage.promptTokens));
-      setText("usage-completion", safeCount(state.usage.completionTokens));
+      setText(
+        "usage-completion",
+        safeCount(state.usage.completionTokens),
+      );
       setText("usage-total", safeCount(state.usage.totalTokens));
-      return;
+      return true;
     }
     if (event.type === "assistant_message") {
-      setText("assistant-output", event.content || "模型未返回文字内容");
-      return;
+      setText(
+        "assistant-output",
+        event.content || "模型未返回文字内容",
+      );
+      return true;
     }
 
     appendStep(event);
@@ -682,6 +1288,7 @@
       finishRun(message, true);
       state.socket?.close(1000, "failed");
     }
+    return true;
   }
 
   function socketFailureMessage(closeEvent) {
@@ -694,12 +1301,29 @@
     return "连接已中断，请重试";
   }
 
+  function watchdogDelay() {
+    const configured = Number(state.maxRunSeconds) * 1000;
+    return Math.min(
+      Math.max(
+        configured + RUN_WATCHDOG_BUFFER_MS,
+        RUN_WATCHDOG_MIN_MS,
+      ),
+      RUN_WATCHDOG_MAX_MS,
+    );
+  }
+
   function startRun(task) {
     const trimmed = task.trim();
-    if (!trimmed || state.running || state.resetting || !state.modelConfigured) {
+    if (
+      !trimmed ||
+      state.running ||
+      state.resetting ||
+      !state.modelConfigured
+    ) {
       return;
     }
 
+    clearRunTimers();
     resetUsage();
     state.running = true;
     resetTraceView();
@@ -710,53 +1334,99 @@
     setStatus("正在连接", "running");
 
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${location.host}/ws/agent`);
+    const socket = new WebSocket(
+      `${protocol}//${location.host}/ws/agent`,
+    );
     state.socket = socket;
-    const connectTimer = window.setTimeout(() => {
-      if (state.running && socket.readyState === WebSocket.CONNECTING) {
-        socket.close();
+    state.connectionTimer = window.setTimeout(() => {
+      if (
+        socket === state.socket &&
+        state.running &&
+        socket.readyState === WebSocket.CONNECTING
+      ) {
+        state.terminalSeen = true;
         setText("assistant-output", "连接超时，请重试");
         finishRun("连接超时", true);
+        socket.close(1000, "connect-timeout");
       }
     }, SOCKET_CONNECT_TIMEOUT_MS);
 
     socket.addEventListener("open", () => {
-      window.clearTimeout(connectTimer);
-      if (socket !== state.socket || !state.running) {
+      if (socket !== state.socket) {
         socket.close();
         return;
       }
+      clearConnectionTimer();
+      if (!state.running) {
+        socket.close();
+        return;
+      }
+      state.runWatchdog = window.setTimeout(() => {
+        if (
+          socket === state.socket &&
+          state.running &&
+          !state.terminalSeen
+        ) {
+          state.terminalSeen = true;
+          setText("assistant-output", "运行响应超时");
+          finishRun("运行响应超时", true);
+          socket.close(1000, "run-watchdog");
+        }
+      }, watchdogDelay());
       setStatus("运行中", "running");
       socket.send(JSON.stringify({ type: "run", task: trimmed }));
     });
 
     socket.addEventListener("message", (message) => {
-      if (socket !== state.socket || typeof message.data !== "string") {
+      if (socket !== state.socket || state.terminalSeen) {
         return;
       }
+      if (
+        typeof message.data !== "string" ||
+        message.data.length > MAX_SOCKET_EVENT_CHARS
+      ) {
+        failProtocol(socket);
+        return;
+      }
+      let event;
       try {
-        handleEvent(JSON.parse(message.data));
+        event = JSON.parse(message.data);
       } catch {
-        setText("assistant-output", "服务返回了无法识别的事件");
-        finishRun("事件格式错误", true);
-        socket.close(1000, "invalid-event");
+        failProtocol(socket);
+        return;
+      }
+      if (!handleEvent(event)) {
+        failProtocol(socket);
       }
     });
 
     socket.addEventListener("error", () => {
-      window.clearTimeout(connectTimer);
-    });
-
-    socket.addEventListener("close", (event) => {
-      window.clearTimeout(connectTimer);
       if (socket !== state.socket) {
         return;
       }
+      clearRunTimers();
+      if (
+        state.running &&
+        !state.terminalSeen
+      ) {
+        state.terminalSeen = true;
+        setText("assistant-output", "连接发生错误，请重试");
+        finishRun("连接发生错误", true);
+        socket.close(1000, "socket-error");
+      }
+    });
+
+    socket.addEventListener("close", (event) => {
+      if (socket !== state.socket) {
+        return;
+      }
+      clearRunTimers();
       state.socket = null;
       if (state.running && !state.terminalSeen) {
+        state.terminalSeen = true;
         const message = socketFailureMessage(event);
         setText("assistant-output", message);
-        appendStep({ type: "run_failed", message });
+        appendStep({ type: "run_failed", message: "Run failed" });
         finishRun(message, true);
       }
     });
@@ -764,15 +1434,32 @@
 
   async function loadMeta() {
     try {
-      const meta = await fetchJson("/api/meta");
-      if (typeof meta.model !== "string" || typeof meta.configured !== "boolean") {
-        throw Object.assign(new Error("invalid meta"), {
-          userMessage: "模型状态格式无法识别",
-        });
+      const response = await fetchJson("/api/meta");
+      const meta = response.data;
+      if (
+        !hasExactKeys(meta, [
+          "model",
+          "configured",
+          "max_run_seconds",
+        ]) ||
+        typeof meta.model !== "string" ||
+        typeof meta.configured !== "boolean" ||
+        typeof meta.max_run_seconds !== "number" ||
+        !Number.isFinite(meta.max_run_seconds) ||
+        meta.max_run_seconds <= 0 ||
+        meta.max_run_seconds > 3600
+      ) {
+        throw userError(
+          "INVALID_META",
+          "模型状态格式无法识别",
+        );
       }
       state.modelConfigured = meta.configured;
+      state.maxRunSeconds = meta.max_run_seconds;
       setModelStatus(
-        meta.configured ? `${meta.model} · 已连接` : `${meta.model} · 未配置`,
+        meta.configured
+          ? `${meta.model} · 已连接`
+          : `${meta.model} · 未配置`,
         meta.configured ? "ready" : "warning",
       );
       if (!meta.configured) {
@@ -781,8 +1468,12 @@
       }
     } catch (error) {
       state.modelConfigured = false;
+      state.maxRunSeconds = null;
       setModelStatus("模型状态不可用", "warning");
-      setStatus(error.userMessage || "连接服务失败", "failed");
+      setStatus(
+        error.userMessage || "连接服务失败",
+        "failed",
+      );
     } finally {
       setControlsBusy();
     }
@@ -792,10 +1483,14 @@
     if (state.running || state.resetting) {
       return;
     }
+    invalidateFileRequest({ clearSelection: true });
     state.resetting = true;
     setControlsBusy();
     setStatus("正在重置工作区", "running");
     byId("reset-dialog").close();
+    setText("viewer-path", "文件预览");
+    setText("viewer-meta", "");
+    setText("file-content", "从左侧选择文件");
     try {
       await fetchJson(
         "/api/reset",
@@ -806,14 +1501,10 @@
         },
         "reset",
       );
-      state.selectedPath = null;
       state.collapsedPaths.clear();
-      setText("viewer-path", "文件预览");
-      setText("viewer-meta", "");
-      setText("file-content", "从左侧选择文件");
       setText("assistant-output", "工作区已重置");
       setStatus("工作区已重置", "completed");
-      await loadTree();
+      await loadTree({ keepFileRequest: true });
     } catch (error) {
       const message = error.userMessage || "工作区重置失败";
       setStatus(message, "failed");
@@ -829,25 +1520,40 @@
       event.preventDefault();
       startRun(byId("task-input").value);
     });
-    byId("refresh-button").addEventListener("click", () => loadTree());
-    byId("tree-load-more").addEventListener("click", () => loadTree({ append: true }));
-    byId("reset-button").addEventListener("click", () => byId("reset-dialog").showModal());
-    byId("cancel-reset").addEventListener("click", () => byId("reset-dialog").close());
-    byId("confirm-reset").addEventListener("click", resetWorkspace);
+    byId("refresh-button").addEventListener("click", () =>
+      loadTree(),
+    );
+    byId("tree-load-more").addEventListener("click", () =>
+      loadTree({ append: true }),
+    );
+    byId("reset-button").addEventListener("click", () =>
+      byId("reset-dialog").showModal(),
+    );
+    byId("cancel-reset").addEventListener("click", () =>
+      byId("reset-dialog").close(),
+    );
+    byId("confirm-reset").addEventListener(
+      "click",
+      resetWorkspace,
+    );
     byId("trace-download").addEventListener("click", (event) => {
       if (!state.runId) {
         event.preventDefault();
       }
     });
     document.querySelectorAll("[data-view]").forEach((button) => {
-      button.addEventListener("click", () => activatePane(button.dataset.view));
+      button.addEventListener("click", () =>
+        activatePane(button.dataset.view),
+      );
     });
   }
 
   document.addEventListener("DOMContentLoaded", async () => {
     bindInterface();
     activatePane("task");
-    mobileLayout.addEventListener("change", () => activatePane(state.activePane));
+    mobileLayout.addEventListener("change", () =>
+      activatePane(state.activePane),
+    );
     refreshIcons();
     disableTraceDownload();
     setControlsBusy();

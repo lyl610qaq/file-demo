@@ -46,6 +46,20 @@ _MAX_FORWARDED_FOR_HOPS = 20
 _MAX_TRUSTED_PROXY_CIDRS = 64
 _ORIGIN_ERROR = "allowed_origin must be a valid HTTP origin"
 _TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_failed"})
+_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; "
+        "connect-src 'self' ws: wss:; img-src 'self' data:; "
+        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; "
+        "form-action 'self'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": (
+        "camera=(), microphone=(), geolocation=(), payment=(), "
+        "usb=(), serial=(), bluetooth=()"
+    ),
+}
 
 
 class _InvalidRunRequest(ValueError):
@@ -856,6 +870,17 @@ def create_app(
     app.state.reset_rate_limiter = SlidingWindowLimiter(
         configured.rate_limit_per_minute
     )
+
+    @app.middleware("http")
+    async def add_security_headers(
+        request: Request,
+        call_next: Callable[..., Any],
+    ) -> Any:
+        response = await call_next(request)
+        for name, value in _SECURITY_HEADERS.items():
+            response.headers[name] = value
+        return response
+
     app.mount(
         "/assets",
         StaticFiles(directory=configured.static_root),
@@ -884,6 +909,7 @@ def create_app(
         return {
             "model": configured.llm_model,
             "configured": app.state.model is not None,
+            "max_run_seconds": configured.max_run_seconds,
         }
 
     @app.get("/api/tree")
