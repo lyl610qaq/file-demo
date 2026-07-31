@@ -312,12 +312,16 @@ class EvidenceDrivenModel:
     def _move_next_or_manifest(self) -> ModelReply:
         if self._pending_paths:
             source = self._pending_paths.pop(0)
-            destination = f"archive/{PurePosixPath(source).name}"
+            relative = PurePosixPath(source).relative_to("drafts")
+            destination = f"archive/{relative.as_posix()}"
             return self._call(
                 "move_file",
                 {"source": source, "destination": destination},
             )
-        names = sorted(PurePosixPath(path).name for path in self.successful_moves)
+        names = sorted(
+            PurePosixPath(path).relative_to("archive").as_posix()
+            for path in self.successful_moves
+        )
         self.generated_content = "".join(f"- {name}\n" for name in names)
         self._phase = "archive-write"
         return self._call(

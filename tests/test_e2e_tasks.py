@@ -128,17 +128,20 @@ def test_demo_seed_matches_clean_git_archive(
     archive_path = tmp_path / "seed.tar"
     extracted = tmp_path / "archive"
 
-    with archive_path.open("wb") as stream:
-        archived = subprocess.run(
-            ["git", "archive", "--format=tar", "HEAD", "demo_workspace_seed"],
-            cwd=ASSET_SEED.parent,
-            stdout=stream,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+    try:
+        with archive_path.open("wb") as stream:
+            archived = subprocess.run(
+                ["git", "archive", "--format=tar", "HEAD", "demo_workspace_seed"],
+                cwd=ASSET_SEED.parent,
+                stdout=stream,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+    except FileNotFoundError:
+        pytest.skip("git is unavailable; cannot verify the tracked seed asset")
     assert archived.returncode == 0, archived.stderr.decode("utf-8")
     with tarfile.open(archive_path) as archive:
-        archive.extractall(extracted)
+        archive.extractall(extracted, filter="data")
 
     materialize_demo_seed(generated)
 
@@ -497,6 +500,45 @@ async def test_t2_active_variant_is_not_moved_and_changes_manifest(
         "archive/old-outline.md",
         "archive/MANIFEST.md",
     }
+
+
+@pytest.mark.asyncio
+async def test_t2_archive_preserves_nested_relative_paths_without_collisions(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "workspace"
+    traces = tmp_path / "traces"
+    materialize_demo_seed(root)
+    nested = root / "drafts" / "nested"
+    nested.mkdir()
+    (nested / "old-outline.md").write_text(
+        "---\nstatus: obsolete\n---\n# Nested obsolete draft\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    model = EvidenceDrivenModel("archive")
+    runner = make_runner(root, traces, model)
+
+    async def sink(event: dict[str, Any]) -> None:
+        pass
+
+    result = await runner.run("归档 status 为 obsolete 的全部草稿", sink)
+
+    assert result.status == "completed"
+    assert model.successful_moves == {
+        "archive/current-name.md",
+        "archive/nested/old-outline.md",
+        "archive/old-outline.md",
+    }
+    assert (root / "archive" / "nested" / "old-outline.md").is_file()
+    assert (root / "archive" / "old-outline.md").is_file()
+    assert (root / "archive" / "MANIFEST.md").read_text(
+        encoding="utf-8"
+    ) == (
+        "- current-name.md\n"
+        "- nested/old-outline.md\n"
+        "- old-outline.md\n"
+    )
 
 
 @pytest.mark.asyncio

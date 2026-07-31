@@ -20,6 +20,7 @@ from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from workspace_agent.config import Settings
 from workspace_agent.demo_data import materialize_demo_seed
+from workspace_agent.safety import WorkspaceGuard
 from workspace_agent.schemas import ModelReply, ToolCall, ToolResult, Usage
 from workspace_agent.web import SlidingWindowLimiter, create_app
 
@@ -2049,6 +2050,524 @@ def test_reset_journal_records_durable_phase_progression(
     assert phases == ["prepared", "backup-created", "workspace-installed"]
     assert fsynced.count(tmp_path) >= 5
     assert reset_artifacts(tmp_path) == []
+
+
+def _reset_journal_record(
+    settings: Settings,
+    *,
+    version: int,
+    phase: str,
+    workspace_was_empty: bool | None = None,
+    seed_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "version": version,
+        "workspace": settings.workspace_root.name,
+        "staging": ".workspace-reset-stage-" + "a" * 32,
+        "backup": ".workspace-reset-backup-" + "b" * 32,
+        "phase": phase,
+    }
+    if version in {2, 3}:
+        assert workspace_was_empty is not None
+        record["workspace_was_empty"] = workspace_was_empty
+    if version == 3:
+        assert seed_fingerprint is not None
+        record["seed_fingerprint"] = seed_fingerprint
+    return record
+
+
+def _write_raw_reset_journal(parent: Path, record: dict[str, Any]) -> None:
+    (parent / ".workspace-reset-journal.json").write_text(
+        json.dumps(record),
+        encoding="utf-8",
+    )
+
+
+def _tree_digest_for_journal(root: Path) -> str:
+    records: list[dict[str, Any]] = []
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            children = sorted(entries, key=lambda entry: entry.name)
+        for entry in children:
+            path = Path(entry.path)
+            relative = path.relative_to(root).as_posix()
+            metadata = os.lstat(path)
+            if os.path.isdir(path):
+                records.append(
+                    {
+                        "path": relative,
+                        "type": "directory",
+                        "bytes": 0,
+                        "sha256": "",
+                    }
+                )
+                pending.append(path)
+            else:
+                content = path.read_bytes()
+                records.append(
+                    {
+                        "path": relative,
+                        "type": "file",
+                        "bytes": metadata.st_size,
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                    }
+                )
+    payload = json.dumps(
+        sorted(records, key=lambda record: record["path"]),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _installed_seed_state(settings: Settings) -> tuple[Path, Path]:
+    parent = settings.workspace_root.parent
+    staging = parent / (".workspace-reset-stage-" + "a" * 32)
+    backup = parent / (".workspace-reset-backup-" + "b" * 32)
+    os.replace(settings.workspace_root, backup)
+    shutil.copytree(settings.seed_root, settings.workspace_root)
+    return staging, backup
+
+
+@pytest.mark.parametrize(
+    "version,record_fields",
+    [
+        (True, {}),
+        (1.0, {}),
+        (2.0, {"workspace_was_empty": False}),
+    ],
+)
+def test_reset_journal_rejects_boolean_and_float_versions(
+    tmp_path: Path,
+    version: object,
+    record_fields: dict[str, Any],
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    record = _reset_journal_record(
+        settings,
+        version=1,
+        phase="prepared",
+    )
+    record["version"] = version
+    record.update(record_fields)
+
+    with pytest.raises(ValueError, match="^invalid reset journal$"):
+        web._validate_reset_journal_record(record, settings.workspace_root.name)
+
+
+def test_reset_journal_accepts_strict_v3_schema(tmp_path: Path) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    record = _reset_journal_record(
+        settings,
+        version=3,
+        phase="prepared",
+        workspace_was_empty=False,
+        seed_fingerprint="a" * 64,
+    )
+
+    assert web._validate_reset_journal_record(
+        record,
+        settings.workspace_root.name,
+    ) == record
+
+
+@pytest.mark.parametrize(
+    "seed_fingerprint",
+    ["A" * 64, "a" * 63, "g" * 64, 123],
+)
+def test_reset_journal_rejects_noncanonical_v3_seed_fingerprint(
+    tmp_path: Path,
+    seed_fingerprint: object,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    record = _reset_journal_record(
+        settings,
+        version=3,
+        phase="prepared",
+        workspace_was_empty=False,
+        seed_fingerprint="a" * 64,
+    )
+    record["seed_fingerprint"] = seed_fingerprint
+
+    with pytest.raises(ValueError, match="^invalid reset journal$"):
+        web._validate_reset_journal_record(record, settings.workspace_root.name)
+
+
+@pytest.mark.parametrize("workspace_was_empty", [False, True])
+def test_v1_backup_created_recovery_preserves_empty_and_nonempty_workspaces(
+    tmp_path: Path,
+    workspace_was_empty: bool,
+) -> None:
+    from workspace_agent import web
+
+    settings = (
+        empty_settings_for(tmp_path)
+        if workspace_was_empty
+        else settings_for(tmp_path)
+    )
+    parent = settings.workspace_root.parent
+    staging = parent / (".workspace-reset-stage-" + "a" * 32)
+    backup = parent / (".workspace-reset-backup-" + "b" * 32)
+    shutil.copytree(settings.seed_root, staging)
+    os.replace(settings.workspace_root, backup)
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=1,
+            phase="backup-created",
+        ),
+    )
+
+    web._recover_workspace_state(settings)
+
+    if workspace_was_empty:
+        assert list(settings.workspace_root.iterdir()) == []
+    else:
+        assert (settings.workspace_root / "a.md").read_text(
+            encoding="utf-8"
+        ) == "body"
+    assert reset_artifacts(parent) == []
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("workspace_was_empty", [False, True])
+def test_legacy_installed_recovery_restores_backup_before_discarding_it(
+    tmp_path: Path,
+    version: int,
+    workspace_was_empty: bool,
+) -> None:
+    from workspace_agent import web
+
+    settings = (
+        empty_settings_for(tmp_path)
+        if workspace_was_empty
+        else settings_for(tmp_path)
+    )
+    parent = settings.workspace_root.parent
+    _, backup = _installed_seed_state(settings)
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=version,
+            phase="workspace-installed",
+            workspace_was_empty=workspace_was_empty,
+        ),
+    )
+
+    web._recover_workspace_state(settings)
+
+    assert not backup.exists()
+    if workspace_was_empty:
+        assert list(settings.workspace_root.iterdir()) == []
+    else:
+        assert (settings.workspace_root / "a.md").read_text(
+            encoding="utf-8"
+        ) == "body"
+    assert reset_artifacts(parent) == []
+
+
+def test_installed_empty_workspace_restores_valid_empty_backup_without_type_error(
+    tmp_path: Path,
+) -> None:
+    from workspace_agent import web
+
+    settings = empty_settings_for(tmp_path)
+    parent = settings.workspace_root.parent
+    _, backup = _installed_seed_state(settings)
+    shutil.rmtree(settings.workspace_root)
+    settings.workspace_root.mkdir()
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=2,
+            phase="workspace-installed",
+            workspace_was_empty=True,
+        ),
+    )
+
+    web._recover_workspace_state(settings)
+
+    assert not backup.exists()
+    assert list(settings.workspace_root.iterdir()) == []
+    assert reset_artifacts(parent) == []
+
+
+@pytest.mark.parametrize("installed_state", ["zero-byte", "different", "partial"])
+def test_v3_installed_recovery_restores_backup_when_fingerprint_mismatches(
+    tmp_path: Path,
+    installed_state: str,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    (settings.seed_root / "nested").mkdir()
+    (settings.seed_root / "nested" / "other.md").write_text(
+        "other",
+        encoding="utf-8",
+    )
+    parent = settings.workspace_root.parent
+    _, backup = _installed_seed_state(settings)
+    if installed_state == "zero-byte":
+        (settings.workspace_root / "seed.md").write_bytes(b"")
+    elif installed_state == "different":
+        (settings.workspace_root / "seed.md").write_text(
+            "different",
+            encoding="utf-8",
+        )
+    else:
+        (settings.workspace_root / "seed.md").unlink()
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=3,
+            phase="workspace-installed",
+            workspace_was_empty=False,
+            seed_fingerprint=_tree_digest_for_journal(settings.seed_root),
+        ),
+    )
+
+    web._recover_workspace_state(settings)
+
+    assert not backup.exists()
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert not (settings.workspace_root / "seed.md").exists()
+    assert reset_artifacts(parent) == []
+
+
+@pytest.mark.parametrize("failure", ["file", "directory"])
+def test_reset_aborts_before_exchange_when_staging_sync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    if failure == "file":
+
+        def fail_file_sync(stream) -> None:
+            raise OSError("simulated file sync failure")
+
+        monkeypatch.setattr(
+            web,
+            "_fsync_file",
+            fail_file_sync,
+            raising=False,
+        )
+    else:
+        original_directory_sync = web._fsync_directory
+
+        def fail_staging_directory_sync(path: Path) -> None:
+            if path.name.startswith(".workspace-reset-stage-"):
+                raise OSError("simulated directory sync failure")
+            original_directory_sync(path)
+
+        monkeypatch.setattr(web, "_fsync_directory", fail_staging_directory_sync)
+
+    with pytest.raises(web._ResetError):
+        web._reset_workspace(settings)
+
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert not (settings.workspace_root / "seed.md").exists()
+    assert reset_artifacts(tmp_path) == []
+
+
+def test_copy_seed_syncs_each_file_and_directory_bottom_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    nested = settings.seed_root / "nested" / "deep"
+    nested.mkdir(parents=True)
+    (nested / "note.md").write_text("nested", encoding="utf-8")
+    staging = tmp_path / (".workspace-reset-stage-" + "a" * 32)
+    staging.mkdir()
+    file_syncs: list[Path] = []
+    directory_syncs: list[Path] = []
+
+    def record_file_sync(stream) -> None:
+        file_syncs.append(Path(stream.name))
+
+    def record_directory_sync(path: Path) -> None:
+        directory_syncs.append(path)
+
+    monkeypatch.setattr(web, "_fsync_file", record_file_sync, raising=False)
+    monkeypatch.setattr(web, "_fsync_directory", record_directory_sync)
+
+    web._copy_seed_directory(
+        WorkspaceGuard(settings.seed_root),
+        WorkspaceGuard(staging),
+    )
+
+    assert {path.relative_to(staging).as_posix() for path in file_syncs} == {
+        "seed.md",
+        "nested/deep/note.md",
+    }
+    assert [path.relative_to(staging).as_posix() for path in directory_syncs] == [
+        "nested/deep",
+        "nested",
+        ".",
+    ]
+
+
+def test_fsync_directory_uses_windows_directory_flush_abstraction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    flushed: list[Path] = []
+
+    def record_windows_flush(path: Path) -> None:
+        flushed.append(path)
+
+    monkeypatch.setattr(web.os, "name", "nt")
+    monkeypatch.setattr(
+        web,
+        "_fsync_windows_directory",
+        record_windows_flush,
+        raising=False,
+    )
+
+    web._fsync_directory(tmp_path)
+
+    assert flushed == [tmp_path]
+
+
+def test_reset_records_v3_seed_fingerprint_before_workspace_exchange(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    records: list[dict[str, Any]] = []
+    original_write = web._write_reset_journal
+
+    def record_journal(parent: Path, record: dict[str, Any]) -> None:
+        records.append(dict(record))
+        original_write(parent, record)
+
+    monkeypatch.setattr(web, "_write_reset_journal", record_journal)
+
+    web._reset_workspace(settings)
+
+    assert [record["phase"] for record in records] == [
+        "prepared",
+        "backup-created",
+        "workspace-installed",
+    ]
+    assert all(record["version"] == 3 for record in records)
+    assert {record["seed_fingerprint"] for record in records} == {
+        _tree_digest_for_journal(settings.seed_root)
+    }
+    assert all(record["workspace_was_empty"] is False for record in records)
+
+
+@pytest.mark.parametrize("corruption", ["zero-byte", "different", "partial"])
+def test_reset_refuses_corrupt_staging_before_preserving_old_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    nested = settings.seed_root / "nested"
+    nested.mkdir()
+    (nested / "other.md").write_text("other", encoding="utf-8")
+    original_copy = web._copy_seed_directory
+
+    def copy_then_corrupt(
+        seed_guard: WorkspaceGuard,
+        workspace_guard: WorkspaceGuard,
+        relative: str = ".",
+    ) -> None:
+        original_copy(seed_guard, workspace_guard, relative)
+        if relative != ".":
+            return
+        staged_file = workspace_guard.root / "seed.md"
+        if corruption == "zero-byte":
+            staged_file.write_bytes(b"")
+        elif corruption == "different":
+            staged_file.write_text("different", encoding="utf-8")
+        else:
+            staged_file.unlink()
+
+    monkeypatch.setattr(web, "_copy_seed_directory", copy_then_corrupt)
+
+    with pytest.raises(web._ResetError):
+        web._reset_workspace(settings)
+
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert not (settings.workspace_root / "seed.md").exists()
+    assert reset_artifacts(tmp_path) == []
+
+
+def test_v3_backup_recovery_converges_after_restore_rename_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    parent = settings.workspace_root.parent
+    staging = parent / (".workspace-reset-stage-" + "a" * 32)
+    backup = parent / (".workspace-reset-backup-" + "b" * 32)
+    shutil.copytree(settings.seed_root, staging)
+    os.replace(settings.workspace_root, backup)
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=3,
+            phase="backup-created",
+            workspace_was_empty=False,
+            seed_fingerprint=_tree_digest_for_journal(settings.seed_root),
+        ),
+    )
+    original_replace = web.os.replace
+
+    def crash_after_restore(
+        source: str | Path,
+        destination: str | Path,
+    ) -> None:
+        original_replace(source, destination)
+        if Path(source) == backup and Path(destination) == settings.workspace_root:
+            raise SimulatedCrash()
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(web.os, "replace", crash_after_restore)
+        with pytest.raises(SimulatedCrash):
+            web._recover_workspace_state(settings)
+
+    web._recover_workspace_state(settings)
+
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert reset_artifacts(parent) == []
 
 
 @pytest.mark.asyncio

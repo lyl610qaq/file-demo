@@ -60,6 +60,10 @@ _RESET_BACKUP_PATTERN = re.compile(
     r"\.workspace-reset-backup-[0-9a-f]{32}\Z",
     flags=re.ASCII,
 )
+_RESET_SEED_FINGERPRINT_PATTERN = re.compile(
+    r"[0-9a-f]{64}\Z",
+    flags=re.ASCII,
+)
 _RESET_PHASES = frozenset(
     {"prepared", "backup-created", "workspace-installed"}
 )
@@ -461,8 +465,10 @@ def _copy_seed_directory(
             with source.open("rb") as source_stream:
                 with destination.open("xb") as destination_stream:
                     shutil.copyfileobj(source_stream, destination_stream)
+                    _fsync_file(destination_stream)
         else:
             raise RuntimeError("seed contains an unsupported entry")
+    _fsync_directory(workspace_guard.resolve(relative, must_exist=True))
 
 
 def _validate_physical_tree(
@@ -485,8 +491,76 @@ def _cleanup_reset_path(path: Path) -> None:
         _remove_entry(path)
 
 
+def _fsync_file(stream: Any) -> None:
+    stream.flush()
+    os.fsync(stream.fileno())
+
+
+def _fsync_windows_directory(path: Path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    generic_write = 0x40000000
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    file_share_delete = 0x00000004
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    flush = kernel32.FlushFileBuffers
+    flush.argtypes = (wintypes.HANDLE,)
+    flush.restype = wintypes.BOOL
+    close = kernel32.CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    handle = create_file(
+        str(path),
+        generic_read | generic_write,
+        file_share_read | file_share_write | file_share_delete,
+        None,
+        open_existing,
+        file_flag_backup_semantics,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise OSError(
+            ctypes.get_last_error(),
+            "CreateFileW failed",
+            str(path),
+        )
+    flush_error: OSError | None = None
+    try:
+        if not flush(handle):
+            flush_error = OSError(
+                ctypes.get_last_error(),
+                "FlushFileBuffers failed",
+                str(path),
+            )
+            raise flush_error
+    finally:
+        if not close(handle) and flush_error is None:
+            raise OSError(
+                ctypes.get_last_error(),
+                "CloseHandle failed",
+                str(path),
+            )
+
+
 def _fsync_directory(path: Path) -> None:
     if os.name == "nt":
+        _fsync_windows_directory(path)
         return
     descriptor = os.open(path, os.O_RDONLY)
     try:
@@ -550,13 +624,29 @@ def _validate_reset_journal_record(
     if not isinstance(record, dict):
         raise ValueError("invalid reset journal")
     version = record.get("version")
+    if type(version) is not int:
+        raise ValueError("invalid reset journal")
     if version == 1 and set(record) == required:
         normalized = dict(record)
-        normalized["workspace_was_empty"] = False
+        normalized["workspace_was_empty"] = None
+        normalized["seed_fingerprint"] = None
     elif (
         version == 2
         and set(record) == required | {"workspace_was_empty"}
         and isinstance(record.get("workspace_was_empty"), bool)
+    ):
+        normalized = dict(record)
+        normalized["seed_fingerprint"] = None
+    elif (
+        version == 3
+        and set(record)
+        == required | {"workspace_was_empty", "seed_fingerprint"}
+        and isinstance(record.get("workspace_was_empty"), bool)
+        and isinstance(record.get("seed_fingerprint"), str)
+        and _RESET_SEED_FINGERPRINT_PATTERN.fullmatch(
+            record["seed_fingerprint"]
+        )
+        is not None
     ):
         normalized = dict(record)
     else:
@@ -686,6 +776,51 @@ def _physical_trees_equal(left: Path, right: Path) -> bool:
     return _tree_fingerprint(left) == _tree_fingerprint(right)
 
 
+def _physical_tree_fingerprint(root: Path) -> str:
+    records = [
+        {
+            "path": path,
+            "type": entry_type,
+            "bytes": byte_count,
+            "sha256": digest,
+        }
+        for path, (entry_type, byte_count, digest) in sorted(
+            _tree_fingerprint(root).items()
+        )
+    ]
+    payload = json.dumps(
+        records,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _allow_empty_workspace_for_recovery(
+    record: dict[str, Any],
+    backup: Path,
+    *,
+    backup_exists: bool,
+) -> bool:
+    workspace_was_empty = record["workspace_was_empty"]
+    if workspace_was_empty is not None:
+        return workspace_was_empty
+    if not backup_exists:
+        return False
+    return _count_readable_regular_files(backup) == 0
+
+
+def _workspace_matches_seed_fingerprint(
+    workspace: Path,
+    seed_fingerprint: str,
+) -> bool:
+    return (
+        _count_readable_regular_files(workspace) > 0
+        and _physical_tree_fingerprint(workspace) == seed_fingerprint
+    )
+
+
 def _restore_reset_backup(
     parent: Path,
     workspace: Path,
@@ -749,7 +884,6 @@ def _recover_journaled_reset(
         _RESET_BACKUP_PATTERN,
     )
     phase = record["phase"]
-    allow_empty_workspace = record["workspace_was_empty"]
     workspace_exists = os.path.lexists(workspace)
     staging_exists = os.path.lexists(staging)
     backup_exists = os.path.lexists(backup)
@@ -761,6 +895,12 @@ def _recover_journaled_reset(
     ):
         if exists:
             _validate_recovery_directory(candidate)
+
+    allow_empty_workspace = _allow_empty_workspace_for_recovery(
+        record,
+        backup,
+        backup_exists=backup_exists,
+    )
 
     if phase == "prepared":
         if backup_exists:
@@ -801,17 +941,25 @@ def _recover_journaled_reset(
             return
         raise ValueError("inconsistent reset journal")
 
-    if workspace_exists:
-        if _count_readable_regular_files(workspace) < 1:
-            if backup_exists:
-                _restore_reset_backup(
-                    parent,
-                    workspace,
-                    staging,
-                    backup,
-                )
-                return
-            raise ValueError("installed workspace is invalid")
+    if record["seed_fingerprint"] is None:
+        if backup_exists:
+            _restore_reset_backup(
+                parent,
+                workspace,
+                staging,
+                backup,
+                allow_empty_workspace=allow_empty_workspace,
+            )
+            return
+        raise ValueError("installed workspace cannot be verified")
+
+    if (
+        workspace_exists
+        and _workspace_matches_seed_fingerprint(
+            workspace,
+            record["seed_fingerprint"],
+        )
+    ):
         if staging_exists:
             _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
         if backup_exists:
@@ -937,6 +1085,9 @@ def _reset_workspace(settings: Settings) -> None:
         staging_guard = WorkspaceGuard(staging)
         _copy_seed_directory(seed_guard, staging_guard)
         _validate_physical_tree(staging, require_nonempty=True)
+        seed_fingerprint = _physical_tree_fingerprint(seed_guard.root)
+        if _physical_tree_fingerprint(staging_guard.root) != seed_fingerprint:
+            raise _ResetError()
     except (OSError, ValueError, _ResetError):
         try:
             if "staging" in locals() and os.path.lexists(staging):
@@ -946,12 +1097,13 @@ def _reset_workspace(settings: Settings) -> None:
         raise _ResetError() from None
 
     journal = {
-        "version": 2,
+        "version": 3,
         "workspace": workspace.name,
         "staging": staging.name,
         "backup": backup.name,
         "phase": "prepared",
         "workspace_was_empty": workspace_was_empty,
+        "seed_fingerprint": seed_fingerprint,
     }
     try:
         _write_reset_journal(parent, journal)
