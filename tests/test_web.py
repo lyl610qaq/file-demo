@@ -2182,6 +2182,47 @@ def test_reset_journal_accepts_strict_v3_schema(tmp_path: Path) -> None:
     ) == record
 
 
+@pytest.mark.parametrize("phase", ["rollback-restoring", "rollback-restored"])
+def test_v3_reset_journal_accepts_durable_rollback_phases(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    record = _reset_journal_record(
+        settings,
+        version=3,
+        phase=phase,
+        workspace_was_empty=True,
+        seed_fingerprint="a" * 64,
+    )
+
+    assert web._validate_reset_journal_record(
+        record,
+        settings.workspace_root.name,
+    ) == record
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_reset_journal_rejects_rollback_phases(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    record = _reset_journal_record(
+        settings,
+        version=version,
+        phase="rollback-restoring",
+        workspace_was_empty=False,
+    )
+
+    with pytest.raises(ValueError, match="^invalid reset journal$"):
+        web._validate_reset_journal_record(record, settings.workspace_root.name)
+
+
 @pytest.mark.parametrize(
     "seed_fingerprint",
     ["A" * 64, "a" * 63, "g" * 64, 123],
@@ -2423,7 +2464,7 @@ def test_legacy_installed_cleanup_finishes_when_backup_was_already_removed(
 
 
 @pytest.mark.parametrize("version", [1, 2])
-def test_legacy_installed_cleanup_rejects_empty_workspace_without_backup(
+def test_legacy_installed_cleanup_converges_empty_workspace_without_backup(
     tmp_path: Path,
     version: int,
 ) -> None:
@@ -2441,10 +2482,37 @@ def test_legacy_installed_cleanup_rejects_empty_workspace_without_backup(
         ),
     )
 
+    web._recover_workspace_state(settings)
+
+    assert list(settings.workspace_root.iterdir()) == []
+    assert reset_artifacts(parent) == []
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_installed_empty_workspace_with_staging_still_rejects(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    from workspace_agent import web
+
+    settings = empty_settings_for(tmp_path)
+    parent = settings.workspace_root.parent
+    staging = parent / (".workspace-reset-stage-" + "a" * 32)
+    shutil.copytree(settings.seed_root, staging)
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=version,
+            phase="workspace-installed",
+            workspace_was_empty=True,
+        ),
+    )
+
     with pytest.raises(ValueError, match="^workspace recovery failed$"):
         web._recover_workspace_state(settings)
 
-    assert list(settings.workspace_root.iterdir()) == []
+    assert staging.is_dir()
     assert (parent / ".workspace-reset-journal.json").is_file()
 
 
@@ -2536,6 +2604,170 @@ def test_v3_installed_recovery_restores_backup_when_fingerprint_mismatches(
         encoding="utf-8"
     ) == "body"
     assert not (settings.workspace_root / "seed.md").exists()
+    assert reset_artifacts(parent) == []
+
+
+def test_v3_installed_empty_workspace_without_rollback_marker_is_rejected(
+    tmp_path: Path,
+) -> None:
+    from workspace_agent import web
+
+    settings = empty_settings_for(tmp_path)
+    parent = settings.workspace_root.parent
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=3,
+            phase="workspace-installed",
+            workspace_was_empty=True,
+            seed_fingerprint=_tree_digest_for_journal(settings.seed_root),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="^workspace recovery failed$"):
+        web._recover_workspace_state(settings)
+
+    assert list(settings.workspace_root.iterdir()) == []
+    assert (parent / ".workspace-reset-journal.json").is_file()
+
+
+def test_v3_installed_corrupt_workspace_without_rollback_marker_is_rejected(
+    tmp_path: Path,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    parent = settings.workspace_root.parent
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=3,
+            phase="workspace-installed",
+            workspace_was_empty=False,
+            seed_fingerprint=_tree_digest_for_journal(settings.seed_root),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="^workspace recovery failed$"):
+        web._recover_workspace_state(settings)
+
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert (parent / ".workspace-reset-journal.json").is_file()
+
+
+def test_v3_rollback_marker_rejects_empty_result_for_nonempty_workspace(
+    tmp_path: Path,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    parent = settings.workspace_root.parent
+    shutil.rmtree(settings.workspace_root)
+    settings.workspace_root.mkdir()
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=3,
+            phase="rollback-restoring",
+            workspace_was_empty=False,
+            seed_fingerprint=_tree_digest_for_journal(settings.seed_root),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="^workspace recovery failed$"):
+        web._recover_workspace_state(settings)
+
+    assert list(settings.workspace_root.iterdir()) == []
+    assert (parent / ".workspace-reset-journal.json").is_file()
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "after-restore-rename",
+        "after-staging-cleanup",
+        "before-journal-cleanup",
+    ],
+)
+def test_empty_backup_rollback_converges_after_second_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: int,
+    checkpoint: str,
+) -> None:
+    from workspace_agent import web
+
+    settings = empty_settings_for(tmp_path)
+    parent = settings.workspace_root.parent
+    staging, backup = _installed_seed_state(settings)
+    shutil.rmtree(settings.workspace_root)
+    settings.workspace_root.mkdir()
+    journal_args: dict[str, Any] = {
+        "version": version,
+        "phase": "workspace-installed",
+        "workspace_was_empty": True,
+    }
+    if version == 3:
+        journal_args["seed_fingerprint"] = _tree_digest_for_journal(
+            settings.seed_root
+        )
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(settings, **journal_args),
+    )
+
+    with monkeypatch.context() as patcher:
+        if checkpoint == "after-restore-rename":
+            original_replace = web.os.replace
+
+            def crash_after_restore_rename(
+                source: str | Path,
+                destination: str | Path,
+            ) -> None:
+                original_replace(source, destination)
+                if (
+                    Path(source) == backup
+                    and Path(destination) == settings.workspace_root
+                ):
+                    raise SimulatedCrash()
+
+            patcher.setattr(web.os, "replace", crash_after_restore_rename)
+        elif checkpoint == "after-staging-cleanup":
+            original_cleanup = web._cleanup_recovery_directory
+
+            def crash_after_staging_cleanup(path: Path, pattern) -> None:
+                original_cleanup(path, pattern)
+                if path == staging and settings.workspace_root.exists():
+                    raise SimulatedCrash()
+
+            patcher.setattr(
+                web,
+                "_cleanup_recovery_directory",
+                crash_after_staging_cleanup,
+            )
+        else:
+
+            def crash_before_journal_cleanup(path: Path) -> None:
+                raise SimulatedCrash()
+
+            patcher.setattr(
+                web,
+                "_remove_reset_journal",
+                crash_before_journal_cleanup,
+            )
+
+        with pytest.raises(SimulatedCrash):
+            web._recover_workspace_state(settings)
+
+    web._recover_workspace_state(settings)
+
+    assert list(settings.workspace_root.iterdir()) == []
     assert reset_artifacts(parent) == []
 
 
@@ -2681,8 +2913,10 @@ def test_reset_restores_backup_when_installed_tree_changes_before_cleanup(
 
     settings = settings_for(tmp_path)
     original_write = web._write_reset_journal
+    phases: list[str] = []
 
     def write_then_mutate(parent: Path, record: dict[str, Any]) -> None:
+        phases.append(record["phase"])
         original_write(parent, record)
         if record["phase"] == "workspace-installed":
             (settings.workspace_root / "seed.md").write_text(
@@ -2699,6 +2933,13 @@ def test_reset_restores_backup_when_installed_tree_changes_before_cleanup(
         encoding="utf-8"
     ) == "body"
     assert not (settings.workspace_root / "seed.md").exists()
+    assert phases == [
+        "prepared",
+        "backup-created",
+        "workspace-installed",
+        "rollback-restoring",
+        "rollback-restored",
+    ]
     assert reset_artifacts(tmp_path) == []
 
 

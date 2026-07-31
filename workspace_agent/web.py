@@ -64,9 +64,13 @@ _RESET_SEED_FINGERPRINT_PATTERN = re.compile(
     r"[0-9a-f]{64}\Z",
     flags=re.ASCII,
 )
-_RESET_PHASES = frozenset(
+_RESET_INSTALL_PHASES = frozenset(
     {"prepared", "backup-created", "workspace-installed"}
 )
+_RESET_ROLLBACK_PHASES = frozenset(
+    {"rollback-restoring", "rollback-restored"}
+)
+_RESET_PHASES = _RESET_INSTALL_PHASES | _RESET_ROLLBACK_PHASES
 _MAX_RESET_JOURNAL_BYTES = 4096
 _TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_failed"})
 _SECURITY_HEADERS = {
@@ -662,7 +666,12 @@ def _validate_reset_journal_record(
         is None
         or normalized["staging"] == normalized["backup"]
         or not isinstance(normalized.get("phase"), str)
-        or normalized["phase"] not in _RESET_PHASES
+        or normalized["phase"]
+        not in (
+            _RESET_PHASES
+            if normalized["version"] == 3
+            else _RESET_INSTALL_PHASES
+        )
     ):
         raise ValueError("invalid reset journal")
     return normalized
@@ -886,6 +895,62 @@ def _finish_restored_backup(
     _cleanup_journal_temps(parent)
 
 
+def _complete_v3_rollback_restore(
+    parent: Path,
+    workspace: Path,
+    staging: Path,
+    backup: Path,
+    record: dict[str, Any],
+) -> None:
+    allow_empty_workspace = record["workspace_was_empty"]
+    if os.path.lexists(backup):
+        _validate_physical_tree(
+            backup,
+            require_nonempty=not allow_empty_workspace,
+        )
+        if os.path.lexists(workspace):
+            if os.path.lexists(staging):
+                _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
+            _validate_recovery_directory(workspace)
+            os.replace(workspace, staging)
+            _fsync_directory(parent)
+        os.replace(backup, workspace)
+        _fsync_directory(parent)
+    elif not os.path.lexists(workspace):
+        raise ValueError("inconsistent reset journal")
+
+    _validate_physical_tree(
+        workspace,
+        require_nonempty=not allow_empty_workspace,
+    )
+    record["phase"] = "rollback-restored"
+    _write_reset_journal(parent, record)
+    _finish_restored_backup(
+        parent,
+        workspace,
+        staging,
+        allow_empty_workspace=allow_empty_workspace,
+    )
+
+
+def _start_v3_rollback_restore(
+    parent: Path,
+    workspace: Path,
+    staging: Path,
+    backup: Path,
+    record: dict[str, Any],
+) -> None:
+    record["phase"] = "rollback-restoring"
+    _write_reset_journal(parent, record)
+    _complete_v3_rollback_restore(
+        parent,
+        workspace,
+        staging,
+        backup,
+        record,
+    )
+
+
 def _recover_journaled_reset(
     settings: Settings,
     parent: Path,
@@ -974,6 +1039,27 @@ def _recover_journaled_reset(
             return
         raise ValueError("inconsistent reset journal")
 
+    if phase == "rollback-restoring":
+        _complete_v3_rollback_restore(
+            parent,
+            workspace,
+            staging,
+            backup,
+            record,
+        )
+        return
+
+    if phase == "rollback-restored":
+        if backup_exists or not workspace_exists:
+            raise ValueError("inconsistent reset journal")
+        _finish_restored_backup(
+            parent,
+            workspace,
+            staging,
+            allow_empty_workspace=allow_empty_workspace,
+        )
+        return
+
     if record["seed_fingerprint"] is None:
         if backup_exists:
             _restore_reset_backup(
@@ -984,13 +1070,23 @@ def _recover_journaled_reset(
                 allow_empty_workspace=allow_empty_workspace,
             )
             return
-        if workspace_exists and _count_readable_regular_files(workspace) > 0:
-            if staging_exists:
-                _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
-            _fsync_directory(parent)
-            _remove_reset_journal(parent)
-            _cleanup_journal_temps(parent)
-            return
+        if workspace_exists:
+            workspace_file_count = _count_readable_regular_files(workspace)
+            staging_file_count = (
+                _count_readable_regular_files(staging)
+                if staging_exists
+                else 0
+            )
+            if workspace_file_count > 0 or staging_file_count == 0:
+                # Legacy journals have neither a seed fingerprint nor a
+                # remaining backup here. An empty physical workspace with no
+                # nonempty staging source is the only usable terminal state.
+                if staging_exists:
+                    _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
+                _fsync_directory(parent)
+                _remove_reset_journal(parent)
+                _cleanup_journal_temps(parent)
+                return
         raise ValueError("installed workspace cannot be verified")
 
     if (
@@ -1009,12 +1105,12 @@ def _recover_journaled_reset(
         _cleanup_journal_temps(parent)
         return
     if backup_exists:
-        _restore_reset_backup(
+        _start_v3_rollback_restore(
             parent,
             workspace,
             staging,
             backup,
-            allow_empty_workspace=allow_empty_workspace,
+            record,
         )
         return
     raise ValueError("inconsistent reset journal")
@@ -1167,12 +1263,12 @@ def _reset_workspace(settings: Settings) -> None:
             workspace,
             journal["seed_fingerprint"],
         ):
-            _restore_reset_backup(
+            _start_v3_rollback_restore(
                 parent,
                 workspace,
                 staging,
                 backup,
-                allow_empty_workspace=workspace_was_empty,
+                journal,
             )
             raise _ResetError()
         _cleanup_reset_path(backup)

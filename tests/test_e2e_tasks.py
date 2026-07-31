@@ -129,6 +129,23 @@ def test_demo_seed_matches_clean_git_archive(
     extracted = tmp_path / "archive"
 
     try:
+        checkout = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            cwd=ASSET_SEED.parent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError:
+        pytest.skip("git is unavailable; cannot verify the tracked seed asset")
+    checkout_stderr = checkout.stderr.decode("utf-8", errors="replace")
+    if checkout.returncode != 0 or checkout.stdout.strip() != b"true":
+        pytest.skip(
+            "not a Git checkout; cannot verify the tracked seed asset: "
+            + checkout_stderr
+        )
+
+    try:
         with archive_path.open("wb") as stream:
             archived = subprocess.run(
                 ["git", "archive", "--format=tar", "HEAD", "demo_workspace_seed"],
@@ -140,8 +157,6 @@ def test_demo_seed_matches_clean_git_archive(
     except FileNotFoundError:
         pytest.skip("git is unavailable; cannot verify the tracked seed asset")
     stderr = archived.stderr.decode("utf-8", errors="replace")
-    if archived.returncode == 128:
-        pytest.skip("git archive cannot access HEAD: " + stderr)
     assert archived.returncode == 0, stderr
     with tarfile.open(archive_path) as archive:
         archive.extractall(extracted, filter="data")
