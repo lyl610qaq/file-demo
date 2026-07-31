@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import uuid
@@ -9,7 +10,7 @@ from typing import Any, Protocol, TypeAlias
 
 from workspace_agent.schemas import ModelReply, RunResult, ToolResult, Usage
 from workspace_agent.tools import TOOL_SCHEMAS, WorkspaceTools
-from workspace_agent.trace import TraceStore, TraceWriter, sanitize_args
+from workspace_agent.trace import TraceStore, TraceWriter
 
 
 SYSTEM_POLICY = (
@@ -122,7 +123,7 @@ class AgentRunner:
                 {
                     "type": "model_call_started",
                     "run_id": run_id,
-                    "model_call": model_calls,
+                    "call": model_calls,
                 },
             )
             try:
@@ -142,6 +143,7 @@ class AgentRunner:
                 {
                     "type": "usage_updated",
                     "run_id": run_id,
+                    "model_calls": model_calls,
                     "usage": usage.as_dict(),
                 },
             )
@@ -150,7 +152,6 @@ class AgentRunner:
             if reply.tool_calls:
                 empty_replies = 0
                 for call in reply.tool_calls:
-                    step += 1
                     signature = _tool_signature(
                         call.name,
                         call.arguments,
@@ -161,7 +162,17 @@ class AgentRunner:
                         previous_signature = signature
                         consecutive_signatures = 1
 
-                    visible_args = sanitize_args(
+                    if consecutive_signatures >= 3:
+                        return await self._fail(
+                            run_id,
+                            "Repeated tool call limit reached",
+                            model_calls,
+                            usage,
+                            sink,
+                        )
+
+                    step += 1
+                    visible_args = _safe_event_args(
                         call.name,
                         call.arguments,
                     )
@@ -171,33 +182,25 @@ class AgentRunner:
                             "type": "tool_started",
                             "run_id": run_id,
                             "step": step,
-                            "tool_call_id": call.id,
                             "tool": call.name,
                             "args": visible_args,
                         },
                     )
 
-                    if consecutive_signatures >= 3:
-                        result = ToolResult(
-                            ok=False,
-                            data={},
-                            summary=(
-                                f"{call.name} was not executed because the "
-                                "same call repeated three times"
-                            ),
-                            error_code="REPEATED_TOOL_CALL",
-                        )
-                    else:
-                        result = await self._execute_tool(
-                            call.name,
-                            call.arguments,
-                        )
+                    result = await self._execute_tool(
+                        call.name,
+                        call.arguments,
+                    )
 
-                    status = "ok" if result.ok else "error"
+                    status = "success" if result.ok else "error"
                     writer.append(
                         step=step,
                         tool=call.name,
-                        args=call.arguments,
+                        args=_safe_trace_args(
+                            call.name,
+                            call.arguments,
+                            visible_args,
+                        ),
                         result_summary=result.summary,
                         status=status,
                     )
@@ -207,11 +210,9 @@ class AgentRunner:
                             "type": "tool_finished",
                             "run_id": run_id,
                             "step": step,
-                            "tool_call_id": call.id,
                             "tool": call.name,
                             "ok": result.ok,
-                            "summary": result.summary,
-                            "error_code": result.error_code,
+                            "result_summary": result.summary,
                         },
                     )
                     messages.append(
@@ -233,7 +234,7 @@ class AgentRunner:
                     {
                         "type": "assistant_message",
                         "run_id": run_id,
-                        "message": content,
+                        "content": content,
                     },
                 )
                 result = RunResult(
@@ -248,6 +249,7 @@ class AgentRunner:
                     {
                         "type": "run_completed",
                         "run_id": run_id,
+                        "status": "completed",
                         "message": content,
                         "model_calls": model_calls,
                         "usage": usage.as_dict(),
@@ -295,23 +297,25 @@ class AgentRunner:
         usage: Usage,
         sink: EventSink,
     ) -> RunResult:
-        await _emit(
-            sink,
-            {
-                "type": "run_failed",
-                "run_id": run_id,
-                "message": message,
-                "model_calls": model_calls,
-                "usage": usage.as_dict(),
-            },
-        )
-        return RunResult(
+        result = RunResult(
             run_id=run_id,
             status="failed",
             message=message,
             model_calls=model_calls,
             usage=usage,
         )
+        await _emit(
+            sink,
+            {
+                "type": "run_failed",
+                "run_id": run_id,
+                "status": "failed",
+                "message": message,
+                "model_calls": model_calls,
+                "usage": usage.as_dict(),
+            },
+        )
+        return result
 
 
 def _tool_signature(name: str, arguments: dict[str, Any]) -> str:
@@ -323,3 +327,52 @@ def _tool_signature(name: str, arguments: dict[str, Any]) -> str:
         allow_nan=False,
     )
     return f"{name}:{canonical}"
+
+
+def _safe_event_args(
+    tool: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    sanitized = dict(arguments)
+    if tool != "write_file":
+        return sanitized
+
+    missing = object()
+    content = sanitized.pop("content", missing)
+    if isinstance(content, str):
+        encoded = content.encode("utf-8")
+        sanitized["content_bytes"] = len(encoded)
+        sanitized["content_sha256"] = hashlib.sha256(encoded).hexdigest()
+        return sanitized
+
+    if content is missing:
+        content_type = "missing"
+    elif isinstance(content, dict):
+        content_type = "dict"
+    elif isinstance(content, list):
+        content_type = "list"
+    elif content is None:
+        content_type = "null"
+    elif isinstance(content, bool):
+        content_type = "bool"
+    elif isinstance(content, (int, float)):
+        content_type = "number"
+    else:
+        content_type = "non-string"
+    sanitized["content_type"] = content_type
+    if isinstance(content, (dict, list)):
+        sanitized["content_size"] = len(content)
+    return sanitized
+
+
+def _safe_trace_args(
+    tool: str,
+    arguments: dict[str, Any],
+    visible_args: dict[str, Any],
+) -> dict[str, Any]:
+    if tool != "write_file" or isinstance(arguments.get("content"), str):
+        return arguments
+
+    trace_args = dict(visible_args)
+    trace_args["content"] = ""
+    return trace_args

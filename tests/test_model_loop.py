@@ -543,16 +543,70 @@ async def test_agent_loop_executes_tool_then_final_and_closes_trace(
     assert result.message == "The file says hello."
     assert result.model_calls == 2
     assert result.usage == Usage(7, 6, 13)
-    assert _event_types(events) == [
-        "run_started",
-        "model_call_started",
-        "usage_updated",
-        "tool_started",
-        "tool_finished",
-        "model_call_started",
-        "usage_updated",
-        "assistant_message",
-        "run_completed",
+    assert events == [
+        {"type": "run_started", "run_id": result.run_id},
+        {
+            "type": "model_call_started",
+            "run_id": result.run_id,
+            "call": 1,
+        },
+        {
+            "type": "usage_updated",
+            "run_id": result.run_id,
+            "model_calls": 1,
+            "usage": {
+                "prompt_tokens": 4,
+                "completion_tokens": 2,
+                "total_tokens": 6,
+            },
+        },
+        {
+            "type": "tool_started",
+            "run_id": result.run_id,
+            "step": 1,
+            "tool": "read_file",
+            "args": {"path": "note.txt", "limit": 100},
+        },
+        {
+            "type": "tool_finished",
+            "run_id": result.run_id,
+            "step": 1,
+            "tool": "read_file",
+            "ok": True,
+            "result_summary": "Read 12 bytes from note.txt",
+        },
+        {
+            "type": "model_call_started",
+            "run_id": result.run_id,
+            "call": 2,
+        },
+        {
+            "type": "usage_updated",
+            "run_id": result.run_id,
+            "model_calls": 2,
+            "usage": {
+                "prompt_tokens": 7,
+                "completion_tokens": 6,
+                "total_tokens": 13,
+            },
+        },
+        {
+            "type": "assistant_message",
+            "run_id": result.run_id,
+            "content": "The file says hello.",
+        },
+        {
+            "type": "run_completed",
+            "run_id": result.run_id,
+            "status": "completed",
+            "message": "The file says hello.",
+            "model_calls": 2,
+            "usage": {
+                "prompt_tokens": 7,
+                "completion_tokens": 6,
+                "total_tokens": 13,
+            },
+        },
     ]
     second_messages, sent_tools = model.calls[1]
     assert sent_tools is TOOL_SCHEMAS
@@ -576,7 +630,7 @@ async def test_agent_loop_executes_tool_then_final_and_closes_trace(
     assert len(records) == 1
     assert records[0]["tool"] == "read_file"
     assert records[0]["args"] == {"path": "note.txt", "limit": 100}
-    assert records[0]["status"] == "ok"
+    assert records[0]["status"] == "success"
     with pytest.raises(ValueError, match="closed"):
         writer.append(
             step=2,
@@ -694,32 +748,41 @@ async def test_agent_loop_blocks_third_identical_consecutive_tool_execution(
     model = ScriptedModel(*repeated, _final_reply("Stopped repeating."))
     tools = _workspace_tools(tmp_path, CountingWorkspaceTools)
     traces = RecordingTraceStore(tmp_path / "traces")
+    events: list[dict[str, Any]] = []
 
     result = await AgentRunner(
         model,
         tools,
         traces,
         max_model_calls=5,
-    ).run("Inspect one path", lambda event: None)
+    ).run("Inspect one path", events.append)
 
-    assert result.status == "completed"
+    assert result.status == "failed"
+    assert "repeated" in result.message.lower()
     assert isinstance(tools, CountingWorkspaceTools)
     assert len(tools.executed) == 2
-    fourth_messages = model.calls[3][0]
-    blocked_payload = json.loads(fourth_messages[-1]["content"])
-    assert blocked_payload["ok"] is False
-    assert blocked_payload["error_code"] == "REPEATED_TOOL_CALL"
+    assert len(model.calls) == 3
+    assert events[-1] == {
+        "type": "run_failed",
+        "run_id": result.run_id,
+        "status": "failed",
+        "message": result.message,
+        "model_calls": 3,
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
+    assert _event_types(events).count("tool_started") == 2
+    assert _event_types(events).count("tool_finished") == 2
     records = [
         json.loads(line)
         for line in traces.writers[0].path.read_text(
             encoding="utf-8"
         ).splitlines()
     ]
-    assert [record["status"] for record in records] == [
-        "error",
-        "error",
-        "error",
-    ]
+    assert [record["status"] for record in records] == ["error", "error"]
 
 
 @pytest.mark.asyncio
@@ -821,6 +884,26 @@ async def test_agent_loop_sanitizes_model_exception(
 
     assert result.status == "failed"
     assert result.message == "Model call failed: RuntimeError"
+    assert events == [
+        {"type": "run_started", "run_id": result.run_id},
+        {
+            "type": "model_call_started",
+            "run_id": result.run_id,
+            "call": 1,
+        },
+        {
+            "type": "run_failed",
+            "run_id": result.run_id,
+            "status": "failed",
+            "message": "Model call failed: RuntimeError",
+            "model_calls": 1,
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        },
+    ]
     serialized = json.dumps(events)
     assert "sk-private" not in serialized
     assert "C:/secret" not in serialized
@@ -945,6 +1028,82 @@ async def test_agent_loop_sanitizes_write_content_in_events_and_trace(
     assert trace_record["args"] == started["args"]
     assert content not in json.dumps(events, ensure_ascii=False)
     assert content not in traces.writers[0].path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("content", "content_type", "content_size", "secret"),
+    [
+        ({"secret": "dict-secret"}, "dict", 1, "dict-secret"),
+        (["list-secret"], "list", 1, "list-secret"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_loop_recovers_from_safely_redacted_malformed_write_content(
+    tmp_path: Path,
+    content: object,
+    content_type: str,
+    content_size: int,
+    secret: str,
+) -> None:
+    call = ToolCall(
+        "call-write",
+        "write_file",
+        {
+            "path": "created.txt",
+            "content": content,
+            "overwrite": False,
+        },
+    )
+    events: list[dict[str, Any]] = []
+    traces = RecordingTraceStore(tmp_path / "traces")
+    model = ScriptedModel(
+        _tool_reply(call),
+        _final_reply("Recovered from invalid arguments."),
+    )
+
+    result = await AgentRunner(
+        model,
+        _workspace_tools(tmp_path),
+        traces,
+        max_model_calls=3,
+    ).run("Create a file", events.append)
+
+    assert result.status == "completed"
+    assert len(model.calls) == 2
+    assert next(
+        event for event in events if event["type"] == "tool_started"
+    ) == {
+        "type": "tool_started",
+        "run_id": result.run_id,
+        "step": 1,
+        "tool": "write_file",
+        "args": {
+            "path": "created.txt",
+            "overwrite": False,
+            "content_type": content_type,
+            "content_size": content_size,
+        },
+    }
+    assert next(
+        event for event in events if event["type"] == "tool_finished"
+    ) == {
+        "type": "tool_finished",
+        "run_id": result.run_id,
+        "step": 1,
+        "tool": "write_file",
+        "ok": False,
+        "result_summary": "write_file failed: content must be a string",
+    }
+    tool_payload = json.loads(model.calls[1][0][-1]["content"])
+    assert tool_payload["ok"] is False
+    assert tool_payload["error_code"] == "INVALID_INPUT"
+    trace_text = traces.writers[0].path.read_text(encoding="utf-8")
+    trace_record = json.loads(trace_text)
+    assert trace_record["status"] == "error"
+    assert trace_record["args"]["content_type"] == content_type
+    assert trace_record["args"]["content_size"] == content_size
+    assert secret not in json.dumps(events, ensure_ascii=False)
+    assert secret not in trace_text
 
 
 @pytest.mark.asyncio
