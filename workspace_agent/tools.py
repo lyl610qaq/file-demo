@@ -1039,6 +1039,8 @@ class WorkspaceTools:
         temp_relative: str | None = None
         temp_identity: tuple[int, int] | None = None
         descriptor: int | None = None
+        relative_path: str | None = None
+        published_no_clobber = False
         try:
             if not isinstance(content, str):
                 raise ToolInputError("content must be a string")
@@ -1069,7 +1071,11 @@ class WorkspaceTools:
                 temp_relative,
                 descriptor,
                 temp_identity,
-            ) = self._create_temp_file(parent_relative, target.name)
+            ) = self._create_temp_file(
+                parent_relative,
+                target.name,
+                relative_path,
+            )
             with os.fdopen(descriptor, "wb", closefd=True) as handle:
                 descriptor = None
                 handle.write(payload)
@@ -1106,39 +1112,16 @@ class WorkspaceTools:
                         "target already exists",
                         "TARGET_EXISTS",
                     ) from error
-                if not self._cleanup_owned_file(
+                published_no_clobber = True
+                cleanup_failure = self._finalize_write_temp(
+                    relative_path,
                     temp_relative,
                     temp_identity,
-                ):
-                    rollback_succeeded = self._remove_owned_file(
-                        relative_path,
-                        temp_identity,
-                    )
-                    self._cleanup_owned_file(
-                        temp_relative,
-                        temp_identity,
-                    )
-                    target_exists = self._safe_path_exists(relative_path)
-                    temp_exists = self._safe_path_exists(temp_relative)
-                    temp_relative = None
-                    rollback_complete = (
-                        rollback_succeeded and not target_exists
-                    )
-                    code = (
-                        "WRITE_CLEANUP_FAILED"
-                        if rollback_complete
-                        else "WRITE_ROLLBACK_FAILED"
-                    )
-                    return _failure(
-                        code,
-                        "write_file failed: publication cleanup failed",
-                        {
-                            "path": relative_path,
-                            "target_exists": target_exists,
-                            "temp_exists": temp_exists,
-                        },
-                    )
+                    published=True,
+                )
                 temp_relative = None
+                if cleanup_failure is not None:
+                    return cleanup_failure
 
             return _success(
                 {
@@ -1147,41 +1130,92 @@ class WorkspaceTools:
                 },
                 f"Wrote {len(payload)} bytes to {relative_path}",
             )
-        except (
-            FileNotFoundError,
-            PathRejected,
-            ToolInputError,
-            TypeError,
-            ValueError,
-            OSError,
-        ) as error:
-            if temp_relative is not None and temp_identity is not None:
-                if not self._cleanup_owned_file(
+        except MemoryError:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
+                descriptor = None
+            if (
+                relative_path is not None
+                and temp_relative is not None
+                and temp_identity is not None
+            ):
+                try:
+                    self._finalize_write_temp(
+                        relative_path,
+                        temp_relative,
+                        temp_identity,
+                        published=published_no_clobber,
+                    )
+                except BaseException:
+                    pass
+                temp_relative = None
+            raise
+        except Exception as error:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                descriptor = None
+            if (
+                relative_path is not None
+                and temp_relative is not None
+                and temp_identity is not None
+            ):
+                cleanup_failure = self._finalize_write_temp(
+                    relative_path,
                     temp_relative,
                     temp_identity,
-                ):
-                    target_exists = self._safe_path_exists(relative_path)
-                    temp_exists = self._safe_path_exists(temp_relative)
-                    temp_relative = None
-                    return _failure(
-                        "WRITE_CLEANUP_FAILED",
-                        "write_file failed: temporary cleanup failed",
-                        {
-                            "path": relative_path,
-                            "target_exists": target_exists,
-                            "temp_exists": temp_exists,
-                        },
-                    )
+                    published=published_no_clobber,
+                )
                 temp_relative = None
-            return _mutation_error_result("write_file", error)
+                if cleanup_failure is not None:
+                    return cleanup_failure
+            if isinstance(
+                error,
+                (
+                    FileNotFoundError,
+                    PathRejected,
+                    ToolInputError,
+                    TypeError,
+                    ValueError,
+                    OSError,
+                ),
+            ):
+                return _mutation_error_result("write_file", error)
+            raise
+        except BaseException:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except BaseException:
+                    pass
+                descriptor = None
+            if (
+                relative_path is not None
+                and temp_relative is not None
+                and temp_identity is not None
+            ):
+                try:
+                    self._finalize_write_temp(
+                        relative_path,
+                        temp_relative,
+                        temp_identity,
+                        published=published_no_clobber,
+                    )
+                except BaseException:
+                    pass
+                temp_relative = None
+            raise
         finally:
             if descriptor is not None:
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
-            if temp_relative is not None and temp_identity is not None:
-                self._cleanup_owned_file(temp_relative, temp_identity)
 
     def move_file(
         self,
@@ -1442,6 +1476,7 @@ class WorkspaceTools:
         self,
         parent_relative: str,
         target_name: str,
+        target_relative: str,
     ) -> tuple[str, int, tuple[int, int]]:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         flags |= getattr(os, "O_BINARY", 0)
@@ -1467,31 +1502,68 @@ class WorkspaceTools:
             except BaseException as error:
                 try:
                     os.close(descriptor)
-                except OSError:
-                    pass
-                cleanup_succeeded = False
+                except BaseException as close_error:
+                    if isinstance(error, MemoryError) or not isinstance(
+                        error,
+                        Exception,
+                    ):
+                        pass
+                    elif isinstance(
+                        close_error,
+                        MemoryError,
+                    ) or not isinstance(close_error, Exception):
+                        raise
+                cleanup_failure: ToolResult | None = None
                 try:
-                    temp = self.guard.resolve(
-                        temp_relative,
-                        must_exist=True,
+                    _, temp_metadata = self._resolve_regular_file(
+                        temp_relative
                     )
-                    os.unlink(temp)
-                    _, remaining = self._optional_lstat(temp_relative)
-                    cleanup_succeeded = remaining is None
-                except (
-                    FileNotFoundError,
-                    PathRejected,
-                    ToolInputError,
-                    TypeError,
-                    ValueError,
-                    OSError,
+                    cleanup_failure = self._finalize_write_temp(
+                        target_relative,
+                        temp_relative,
+                        (temp_metadata.st_dev, temp_metadata.st_ino),
+                        published=False,
+                    )
+                except BaseException as cleanup_error:
+                    if isinstance(error, MemoryError) or not isinstance(
+                        error,
+                        Exception,
+                    ):
+                        raise error.with_traceback(error.__traceback__)
+                    if isinstance(
+                        cleanup_error,
+                        MemoryError,
+                    ) or not isinstance(cleanup_error, Exception):
+                        raise
+                    try:
+                        target_exists = self._safe_path_exists(
+                            target_relative
+                        )
+                        temp_exists = self._safe_path_exists(temp_relative)
+                    except MemoryError:
+                        raise
+                    except Exception:
+                        target_exists = True
+                        temp_exists = True
+                    cleanup_failure = _failure(
+                        "WRITE_CLEANUP_FAILED",
+                        "write_file failed: temporary finalization failed",
+                        {
+                            "path": target_relative,
+                            "target_exists": target_exists,
+                            "temp_exists": temp_exists,
+                        },
+                    )
+                if isinstance(error, MemoryError) or not isinstance(
+                    error,
+                    Exception,
                 ):
-                    pass
-                if not cleanup_succeeded:
+                    raise
+                if cleanup_failure is not None:
                     raise ToolInputError(
                         "temporary file cleanup failed",
                         "WRITE_CLEANUP_FAILED",
-                        {"temp_exists": True},
+                        cleanup_failure.data,
                     ) from error
                 raise
             return ownership
@@ -1513,6 +1585,71 @@ class WorkspaceTools:
         identity: tuple[int, int],
     ) -> bool:
         return self._remove_owned_file(relative_path, identity)
+
+    def _finalize_write_temp(
+        self,
+        target_relative: str,
+        temp_relative: str,
+        identity: tuple[int, int],
+        *,
+        published: bool,
+    ) -> ToolResult | None:
+        try:
+            cleanup_succeeded = self._cleanup_owned_file(
+                temp_relative,
+                identity,
+            )
+        except MemoryError:
+            raise
+        except Exception:
+            cleanup_succeeded = False
+        if cleanup_succeeded:
+            return None
+
+        rollback_succeeded = True
+        if published:
+            try:
+                rollback_succeeded = self._remove_owned_file(
+                    target_relative,
+                    identity,
+                )
+            except MemoryError:
+                raise
+            except Exception:
+                rollback_succeeded = False
+        try:
+            self._cleanup_owned_file(temp_relative, identity)
+        except MemoryError:
+            raise
+        except Exception:
+            pass
+
+        try:
+            target_exists = self._safe_path_exists(target_relative)
+            temp_exists = self._safe_path_exists(temp_relative)
+        except MemoryError:
+            raise
+        except Exception:
+            target_exists = True
+            temp_exists = True
+        rollback_complete = (
+            not published
+            or (rollback_succeeded and not target_exists)
+        )
+        code = (
+            "WRITE_CLEANUP_FAILED"
+            if rollback_complete
+            else "WRITE_ROLLBACK_FAILED"
+        )
+        return _failure(
+            code,
+            "write_file failed: temporary finalization failed",
+            {
+                "path": target_relative,
+                "target_exists": target_exists,
+                "temp_exists": temp_exists,
+            },
+        )
 
     def _remove_owned_file(
         self,

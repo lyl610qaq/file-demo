@@ -297,6 +297,111 @@ def test_write_file_fsync_failure_removes_temp(
     assert list(root.iterdir()) == []
 
 
+def test_execute_reports_fsync_runtime_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    tools_module = _tools_module()
+    original_unlink = tools_module.os.unlink
+
+    def failing_fsync(descriptor: int) -> None:
+        raise RuntimeError(f"simulated fsync failure at {root}")
+
+    def failing_temp_unlink(path, *args, **kwargs) -> None:
+        if Path(path).name.startswith(".note.txt."):
+            raise OSError("simulated persistent cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(tools_module.os, "fsync", failing_fsync)
+    monkeypatch.setattr(tools_module.os, "unlink", failing_temp_unlink)
+
+    result = _tools(root).execute(
+        "write_file",
+        {"path": "note.txt", "content": "content"},
+    )
+
+    temp_files = [
+        child
+        for child in root.iterdir()
+        if child.name.startswith(".note.txt.")
+    ]
+    assert result.ok is False
+    assert result.error_code == "WRITE_CLEANUP_FAILED"
+    assert result.data == {
+        "path": "note.txt",
+        "target_exists": False,
+        "temp_exists": True,
+    }
+    assert len(temp_files) == 1
+    assert not (root / "note.txt").exists()
+    assert str(root) not in repr(result)
+    assert str(root) not in repr(result.model_payload())
+
+
+def test_execute_preserves_fstat_memory_error_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    tools_module = _tools_module()
+    original_unlink = tools_module.os.unlink
+
+    def failing_fstat(descriptor: int):
+        raise MemoryError("simulated fstat exhaustion")
+
+    def failing_temp_unlink(path, *args, **kwargs) -> None:
+        if Path(path).name.startswith(".note.txt."):
+            raise OSError("simulated persistent cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(tools_module.os, "fstat", failing_fstat)
+    monkeypatch.setattr(tools_module.os, "unlink", failing_temp_unlink)
+
+    with pytest.raises(MemoryError, match="simulated fstat exhaustion"):
+        _tools(root).execute(
+            "write_file",
+            {"path": "note.txt", "content": "content"},
+        )
+
+    temp_files = [
+        child
+        for child in root.iterdir()
+        if child.name.startswith(".note.txt.")
+    ]
+    assert len(temp_files) == 1
+    assert not (root / "note.txt").exists()
+
+
+def test_execute_sanitizes_fsync_runtime_after_successful_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    tools_module = _tools_module()
+
+    def failing_fsync(descriptor: int) -> None:
+        raise RuntimeError(f"simulated fsync failure at {root}")
+
+    monkeypatch.setattr(tools_module.os, "fsync", failing_fsync)
+
+    result = _tools(root).execute(
+        "write_file",
+        {"path": "note.txt", "content": "content"},
+    )
+
+    assert result.ok is False
+    assert result.error_code == "TOOL_EXECUTION_FAILED"
+    assert result.data == {}
+    assert list(root.iterdir()) == []
+    assert str(root) not in result.summary
+    assert str(root) not in repr(result)
+    assert str(root) not in repr(result.model_payload())
+
+
 def test_write_file_rejects_non_string_and_oversized_utf8_content(
     tmp_path: Path,
 ) -> None:
