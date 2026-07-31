@@ -50,6 +50,7 @@ class TraceWriter:
         args: dict[str, Any],
         result_summary: str,
         status: str,
+        error_code: str | None = None,
     ) -> None:
         record = {
             "step": step,
@@ -59,6 +60,8 @@ class TraceWriter:
             "status": status,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        if error_code is not None:
+            record["error_code"] = error_code
         line = json.dumps(
             record,
             ensure_ascii=False,

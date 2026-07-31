@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -591,6 +592,79 @@ async def test_runner_terminal_wins_a_simultaneous_extra_frame_and_latches() -> 
     assert "simultaneous-extra-secret" not in json.dumps(socket.sent)
 
 
+@pytest.mark.asyncio
+async def test_terminal_slot_stays_consumed_when_transport_raises() -> None:
+    from workspace_agent import web
+
+    class RaiseAfterSendSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+
+        async def send_json(self, event: dict[str, Any]) -> None:
+            self.sent.append(event)
+            if event["type"] == "run_completed":
+                raise RuntimeError("transport outcome is uncertain")
+
+        async def close(self, code: int) -> None:
+            return None
+
+    socket = RaiseAfterSendSocket()
+    channel = web._RunChannel(socket)
+
+    with pytest.raises(RuntimeError, match="transport outcome"):
+        await channel.send_runner_event(
+            {"type": "run_completed", "message": "done"}
+        )
+    sent_failure = await channel.send_failure(
+        "Run failed",
+        close_code=1011,
+    )
+
+    assert sent_failure is False
+    assert socket.sent == [{"type": "run_completed", "message": "done"}]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_terminal_sender_cannot_replace_cancelled_send() -> None:
+    from workspace_agent import web
+
+    class CancelAfterSendSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+            self.first_sent = asyncio.Event()
+            self.never = asyncio.Event()
+
+        async def send_json(self, event: dict[str, Any]) -> None:
+            self.sent.append(event)
+            if len(self.sent) == 1:
+                self.first_sent.set()
+                await self.never.wait()
+
+        async def close(self, code: int) -> None:
+            return None
+
+    socket = CancelAfterSendSocket()
+    channel = web._RunChannel(socket)
+    first = asyncio.create_task(
+        channel.send_runner_event(
+            {"type": "run_completed", "message": "done"}
+        )
+    )
+    await socket.first_sent.wait()
+    competing = asyncio.create_task(
+        channel.send_failure("Run failed", close_code=1011)
+    )
+    await asyncio.sleep(0)
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    competing_result = await competing
+
+    assert competing_result is False
+    assert socket.sent == [{"type": "run_completed", "message": "done"}]
+
+
 def test_websocket_run_timeout_cancels_model_and_sends_one_terminal(
     tmp_path: Path,
 ) -> None:
@@ -623,7 +697,16 @@ def test_websocket_run_timeout_cancels_model_and_sends_one_terminal(
 def test_websocket_timeout_waits_for_tool_before_releasing_workspace(
     tmp_path: Path,
 ) -> None:
-    call = ToolCall("call-timeout", "stat_path", {"path": "."})
+    content = "committed by timed out run"
+    call = ToolCall(
+        "call-timeout",
+        "write_file",
+        {
+            "path": "timeout-write.txt",
+            "content": content,
+            "overwrite": False,
+        },
+    )
     app = create_app(
         settings_for(tmp_path, max_run_seconds=0.05),
         model=ScriptedModel(tool_reply(call)),
@@ -631,12 +714,15 @@ def test_websocket_timeout_waits_for_tool_before_releasing_workspace(
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
+    original_execute = app.state.tools.execute
 
     def blocking_execute(name: str, arguments: dict[str, Any]) -> ToolResult:
         started.set()
         release.wait()
-        finished.set()
-        return ToolResult(ok=True, data={}, summary="settled")
+        try:
+            return original_execute(name, arguments)
+        finally:
+            finished.set()
 
     app.state.tools.execute = blocking_execute
 
@@ -653,9 +739,29 @@ def test_websocket_timeout_waits_for_tool_before_releasing_workspace(
             terminal = socket.receive_json()
             assert finished.is_set()
 
+        written_content = (
+            app.state.tools.guard.root / "timeout-write.txt"
+        ).read_text(encoding="utf-8")
         reset = post_reset(client)
 
+    trace_files = list((tmp_path / "traces").glob("*.jsonl"))
+    assert len(trace_files) == 1
+    record = json.loads(trace_files[0].read_text(encoding="utf-8"))
     assert terminal == {"type": "run_failed", "message": "Run timed out"}
+    assert written_content == content
+    assert record["status"] == "success_after_cancel"
+    assert record["result_summary"] == (
+        f"Wrote {len(content.encode('utf-8'))} bytes to timeout-write.txt"
+    )
+    assert record["args"] == {
+        "path": "timeout-write.txt",
+        "overwrite": False,
+        "content_bytes": len(content.encode("utf-8")),
+        "content_sha256": hashlib.sha256(
+            content.encode("utf-8")
+        ).hexdigest(),
+    }
+    assert content not in trace_files[0].read_text(encoding="utf-8")
     assert reset.status_code == 200
 
 
@@ -1396,7 +1502,8 @@ def test_websocket_disconnect_cancels_runner_and_waits_for_tool(
         json.loads(line)
         for line in trace_files[0].read_text(encoding="utf-8").splitlines()
     ]
-    assert records[-1]["status"] == "cancelled"
+    assert records[-1]["status"] == "success_after_cancel"
+    assert records[-1]["result_summary"] == "settled"
 
 
 def test_app_closes_only_the_model_it_constructed(

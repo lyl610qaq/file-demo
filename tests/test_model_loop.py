@@ -713,6 +713,19 @@ class BlockingWorkspaceTools(WorkspaceTools):
         return result
 
 
+class FailingBlockingWorkspaceTools(BlockingWorkspaceTools):
+    def execute(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ):
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("test worker was not released")
+        self.finished.set()
+        raise RuntimeError("api-key=worker-secret path=C:/private")
+
+
 def _workspace_tools(
     tmp_path: Path,
     tool_type: type[WorkspaceTools] = WorkspaceTools,
@@ -1502,11 +1515,109 @@ async def test_agent_loop_waits_for_tool_worker_before_propagating_cancel(
     assert tools.finished.is_set()
     assert writer._handle.closed
     record = json.loads(writer.path.read_text(encoding="utf-8"))
-    assert record["status"] == "cancelled"
-    assert record["result_summary"] == (
-        "Tool execution settled after run cancellation"
-    )
+    assert record["status"] == "success_after_cancel"
+    assert record["result_summary"] == "Inspected ."
+    assert "error_code" not in record
     assert "data" not in record["result_summary"].lower()
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_records_committed_write_after_cancel(
+    tmp_path: Path,
+) -> None:
+    tools = _workspace_tools(tmp_path, BlockingWorkspaceTools)
+    assert isinstance(tools, BlockingWorkspaceTools)
+    content = "committed after cancellation"
+    traces = RecordingTraceStore(tmp_path / "traces")
+    runner_task = asyncio.create_task(
+        AgentRunner(
+            ScriptedModel(
+                _tool_reply(
+                    ToolCall(
+                        "call-write",
+                        "write_file",
+                        {
+                            "path": "committed.txt",
+                            "content": content,
+                            "overwrite": False,
+                        },
+                    )
+                )
+            ),
+            tools,
+            traces,
+            max_model_calls=2,
+        ).run("Write the file", lambda event: None)
+    )
+
+    assert await asyncio.to_thread(tools.started.wait, 2)
+    writer = traces.writers[0]
+    runner_task.cancel()
+    tools.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner_task
+
+    assert tools.finished.is_set()
+    assert writer._handle.closed
+    assert (tools.guard.root / "committed.txt").read_text(
+        encoding="utf-8"
+    ) == content
+    record = json.loads(writer.path.read_text(encoding="utf-8"))
+    assert record["status"] == "success_after_cancel"
+    assert record["result_summary"] == (
+        f"Wrote {len(content.encode('utf-8'))} bytes to committed.txt"
+    )
+    assert record["args"] == {
+        "path": "committed.txt",
+        "overwrite": False,
+        "content_bytes": len(content.encode("utf-8")),
+        "content_sha256": hashlib.sha256(
+            content.encode("utf-8")
+        ).hexdigest(),
+    }
+    assert "content" not in record["args"]
+    assert "error_code" not in record
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_records_worker_error_after_cancel_without_secrets(
+    tmp_path: Path,
+) -> None:
+    tools = _workspace_tools(tmp_path, FailingBlockingWorkspaceTools)
+    assert isinstance(tools, FailingBlockingWorkspaceTools)
+    traces = RecordingTraceStore(tmp_path / "traces")
+    runner_task = asyncio.create_task(
+        AgentRunner(
+            ScriptedModel(
+                _tool_reply(
+                    ToolCall("call-error", "stat_path", {"path": "."})
+                )
+            ),
+            tools,
+            traces,
+            max_model_calls=2,
+        ).run("Inspect root", lambda event: None)
+    )
+
+    assert await asyncio.to_thread(tools.started.wait, 2)
+    writer = traces.writers[0]
+    runner_task.cancel()
+    tools.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner_task
+
+    assert tools.finished.is_set()
+    assert writer._handle.closed
+    record = json.loads(writer.path.read_text(encoding="utf-8"))
+    assert record["status"] == "error_after_cancel"
+    assert record["result_summary"] == "stat_path failed: RuntimeError"
+    assert record["error_code"] == "TOOL_EXECUTION_FAILED"
+    assert record["args"] == {"path": "."}
+    serialized = json.dumps(record)
+    assert "worker-secret" not in serialized
+    assert "C:/private" not in serialized
 
 
 def test_system_policy_is_generic_and_marks_injection_boundary() -> None:

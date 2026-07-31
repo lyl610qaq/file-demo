@@ -244,7 +244,7 @@ class AgentRunner:
                     result = await self._execute_tool(
                         call.name,
                         call.arguments,
-                        on_cancelled=lambda: writer.append(
+                        on_cancelled=lambda settled_result: writer.append(
                             step=step,
                             tool=call.name,
                             args=_safe_trace_args(
@@ -252,10 +252,13 @@ class AgentRunner:
                                 call.arguments,
                                 visible_args,
                             ),
-                            result_summary=(
-                                "Tool execution settled after run cancellation"
+                            result_summary=settled_result.summary,
+                            status=(
+                                "success_after_cancel"
+                                if settled_result.ok
+                                else "error_after_cancel"
                             ),
-                            status="cancelled",
+                            error_code=settled_result.error_code,
                         ),
                     )
 
@@ -270,6 +273,7 @@ class AgentRunner:
                         ),
                         result_summary=result.summary,
                         status=status,
+                        error_code=result.error_code,
                     )
                     await _emit(
                         sink,
@@ -367,7 +371,7 @@ class AgentRunner:
         name: str,
         arguments: dict[str, Any],
         *,
-        on_cancelled: Callable[[], None],
+        on_cancelled: Callable[[ToolResult], None],
     ) -> ToolResult:
         worker = asyncio.create_task(
             asyncio.to_thread(
@@ -386,9 +390,16 @@ class AgentRunner:
                     continue
                 except Exception:
                     break
-            if worker.done() and not worker.cancelled():
-                worker.exception()
-            on_cancelled()
+            try:
+                settled_result = worker.result()
+            except Exception as error:
+                settled_result = ToolResult(
+                    ok=False,
+                    data={},
+                    summary=f"{name} failed: {type(error).__name__}",
+                    error_code="TOOL_EXECUTION_FAILED",
+                )
+            on_cancelled(settled_result)
             raise
         except Exception as error:
             return ToolResult(

@@ -587,9 +587,11 @@ class _RunChannel:
         async with self._lock:
             if self._terminal_source is not None:
                 return
-            await self._socket.send_json(event)
-            if event.get("type") in _TERMINAL_EVENT_TYPES:
+            is_terminal = event.get("type") in _TERMINAL_EVENT_TYPES
+            if is_terminal:
                 self._terminal_source = "runner"
+            await self._socket.send_json(event)
+            if is_terminal:
                 with suppress(RuntimeError, WebSocketDisconnect):
                     await self._socket.close(code=1000)
 
@@ -597,13 +599,13 @@ class _RunChannel:
         async with self._lock:
             if self._terminal_source is not None:
                 return False
+            self._terminal_source = "control"
             try:
                 await self._socket.send_json(
                     {"type": "run_failed", "message": message}
                 )
             except (RuntimeError, WebSocketDisconnect):
                 return False
-            self._terminal_source = "control"
             with suppress(RuntimeError, WebSocketDisconnect):
                 await self._socket.close(code=close_code)
             return True
