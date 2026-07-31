@@ -1360,12 +1360,35 @@ class WorkspaceTools:
                 descriptor = os.open(temp, flags, 0o600)
             except FileExistsError:
                 continue
-            metadata = os.fstat(descriptor)
-            return (
-                temp_relative,
-                descriptor,
-                (metadata.st_dev, metadata.st_ino),
-            )
+            try:
+                metadata = os.fstat(descriptor)
+                ownership = (
+                    temp_relative,
+                    descriptor,
+                    (metadata.st_dev, metadata.st_ino),
+                )
+            except BaseException:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                try:
+                    temp = self.guard.resolve(
+                        temp_relative,
+                        must_exist=True,
+                    )
+                    os.unlink(temp)
+                except (
+                    FileNotFoundError,
+                    PathRejected,
+                    ToolInputError,
+                    TypeError,
+                    ValueError,
+                    OSError,
+                ):
+                    pass
+                raise
+            return ownership
         raise OSError("could not allocate temporary file")
 
     def _resolve_owned_file(

@@ -1,5 +1,4 @@
 import importlib
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -156,6 +155,38 @@ def test_write_file_cleans_temp_after_publish_failure(
     assert list(root.iterdir()) == [target]
 
 
+def test_write_file_cleans_descriptor_and_temp_when_fstat_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    tools_module = _tools_module()
+    original_open = tools_module.os.open
+    original_fstat = tools_module.os.fstat
+    opened_descriptors: list[int] = []
+
+    def recording_open(path, flags, mode=0o777, *args, **kwargs) -> int:
+        descriptor = original_open(path, flags, mode, *args, **kwargs)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    def failing_fstat(descriptor: int):
+        raise OSError("simulated fstat failure")
+
+    monkeypatch.setattr(tools_module.os, "open", recording_open)
+    monkeypatch.setattr(tools_module.os, "fstat", failing_fstat)
+
+    result = _tools(root).write_file(path="note.txt", content="content")
+
+    assert result.ok is False
+    assert result.error_code == "WRITE_FAILED"
+    assert len(opened_descriptors) == 1
+    with pytest.raises(OSError):
+        original_fstat(opened_descriptors[0])
+    assert list(root.iterdir()) == []
+
+
 def test_write_file_rejects_non_string_and_oversized_utf8_content(
     tmp_path: Path,
 ) -> None:
@@ -298,14 +329,16 @@ def test_move_file_rolls_back_destination_when_source_unlink_fails(
     assert not destination.exists()
 
 
-def test_mutations_revalidate_guard_before_publication_operations(
+def test_mutations_resolve_operands_immediately_before_each_operation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     (root / "source.txt").write_text("source", encoding="utf-8")
-    events: list[tuple[str, str]] = []
+    (root / "rollback-source.txt").write_text("rollback", encoding="utf-8")
+    (root / "replace.txt").write_text("old", encoding="utf-8")
+    events: list[tuple[str, ...]] = []
 
     class RecordingGuard(WorkspaceGuard):
         def resolve(self, relative: str, must_exist: bool = False) -> Path:
@@ -314,63 +347,128 @@ def test_mutations_revalidate_guard_before_publication_operations(
             return resolved
 
     tools_module = _tools_module()
+    original_mkdir = tools_module.os.mkdir
+    original_open = tools_module.os.open
     original_link = tools_module.os.link
     original_replace = tools_module.os.replace
+    original_unlink = tools_module.os.unlink
+    failing_unlink: str | None = None
+
+    def relative(path) -> str:
+        return Path(path).relative_to(root).as_posix()
+
+    def recording_mkdir(path, *args, **kwargs) -> None:
+        events.append(("mkdir", relative(path)))
+        original_mkdir(path, *args, **kwargs)
+
+    def recording_open(path, flags, mode=0o777, *args, **kwargs) -> int:
+        events.append(("open", relative(path)))
+        return original_open(path, flags, mode, *args, **kwargs)
 
     def recording_link(source, destination, *args, **kwargs) -> None:
-        events.append(
-            (
-                "link",
-                f"{Path(source).name}->{Path(destination).name}",
-            )
-        )
+        events.append(("link", relative(source), relative(destination)))
         original_link(source, destination, *args, **kwargs)
 
     def recording_replace(source, destination, *args, **kwargs) -> None:
-        events.append(
-            (
-                "replace",
-                f"{Path(source).name}->{Path(destination).name}",
-            )
-        )
+        events.append(("replace", relative(source), relative(destination)))
         original_replace(source, destination, *args, **kwargs)
 
+    def recording_unlink(path, *args, **kwargs) -> None:
+        path_relative = relative(path)
+        events.append(("unlink", path_relative))
+        if path_relative == failing_unlink:
+            raise OSError("simulated source unlink failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(tools_module.os, "mkdir", recording_mkdir)
+    monkeypatch.setattr(tools_module.os, "open", recording_open)
     monkeypatch.setattr(tools_module.os, "link", recording_link)
     monkeypatch.setattr(tools_module.os, "replace", recording_replace)
+    monkeypatch.setattr(tools_module.os, "unlink", recording_unlink)
     tools = tools_module.WorkspaceTools(
         RecordingGuard(root),
         max_read_bytes=1024,
         max_write_bytes=1024,
     )
+    events.clear()
 
-    written = tools.write_file(
-        path="written.txt",
-        content="written",
+    published = tools.write_file(
+        path="nested/deep/published.txt",
+        content="published",
+    )
+    replaced = tools.write_file(
+        path="replace.txt",
+        content="new",
         overwrite=True,
     )
     moved = tools.move_file(
         source="source.txt",
         destination="nested/moved.txt",
     )
+    failing_unlink = "rollback-source.txt"
+    rolled_back = tools.move_file(
+        source="rollback-source.txt",
+        destination="nested/rollback.txt",
+    )
 
-    assert written.ok
+    assert published.ok
+    assert replaced.ok
     assert moved.ok
-    replace_index = next(
-        index for index, event in enumerate(events) if event[0] == "replace"
-    )
-    move_link_index = max(
-        index for index, event in enumerate(events) if event[0] == "link"
-    )
-    assert ("resolve", "written.txt") in events[max(0, replace_index - 4) : replace_index]
-    assert ("resolve", "source.txt") in events[max(0, move_link_index - 8) : move_link_index]
-    assert ("resolve", "nested/moved.txt") in events[
-        max(0, move_link_index - 8) : move_link_index
+    assert rolled_back.ok is False
+    assert rolled_back.error_code == "MOVE_FAILED"
+
+    mutation_indexes = [
+        index
+        for index, event in enumerate(events)
+        if event[0] in {"mkdir", "open", "link", "replace", "unlink"}
     ]
-    assert sum(event == ("resolve", "written.txt") for event in events) >= 2
-    assert sum(event == ("resolve", "source.txt") for event in events) >= 2
-    assert sum(
-        event == ("resolve", "nested/moved.txt") for event in events
-    ) >= 2
+    operation_counts = {
+        operation: sum(events[index][0] == operation for index in mutation_indexes)
+        for operation in {"mkdir", "open", "link", "replace", "unlink"}
+    }
+    assert operation_counts == {
+        "mkdir": 2,
+        "open": 2,
+        "link": 3,
+        "replace": 1,
+        "unlink": 4,
+    }, f"mutation operation coverage was {operation_counts!r}"
+    for index in mutation_indexes:
+        event = events[index]
+        operation = event[0]
+        if operation in {"mkdir", "open", "unlink"}:
+            assert events[index - 1] == ("resolve", event[1]), (
+                f"{operation}({event[1]}) was preceded by "
+                f"{events[index - 1]!r}"
+            )
+        elif operation == "link":
+            source_relative, destination_relative = event[1:]
+            if Path(source_relative).name.startswith(".published.txt."):
+                expected = [
+                    ("resolve", source_relative),
+                    ("resolve", "nested/deep"),
+                    ("resolve", destination_relative),
+                ]
+            else:
+                expected = [
+                    ("resolve", "nested"),
+                    ("resolve", source_relative),
+                    ("resolve", destination_relative),
+                ]
+            assert events[index - 3 : index] == expected, (
+                f"link({source_relative}, {destination_relative}) had "
+                f"safety events {events[index - 3 : index]!r}"
+            )
+        else:
+            source_relative, destination_relative = event[1:]
+            assert events[index - 3 : index] == [
+                ("resolve", source_relative),
+                ("resolve", "."),
+                ("resolve", destination_relative),
+            ], (
+                f"replace({source_relative}, {destination_relative}) had "
+                f"safety events {events[index - 3 : index]!r}"
+            )
 
 
 @pytest.mark.parametrize("operation", ["write", "move"])
@@ -428,32 +526,186 @@ def test_mutations_reject_parent_replaced_with_nonphysical_link(
             _remove_directory_link(root / "nested")
 
 
-def test_tool_schemas_define_exact_public_surface() -> None:
-    schemas = _tools_module().TOOL_SCHEMAS
-    names = [schema["function"]["name"] for schema in schemas]
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction test")
+@pytest.mark.parametrize("operation", ["write", "move"])
+@pytest.mark.parametrize("checkpoint", ["outer_parent", "inner_parent"])
+def test_mutations_reject_multi_parent_junction_substitution(
+    tmp_path: Path,
+    operation: str,
+    checkpoint: str,
+) -> None:
+    root = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    if operation == "move":
+        (root / "source.txt").write_text("source", encoding="utf-8")
+    destination = "level1/level2/destination.txt"
 
-    assert names == [
+    class SwappingGuard(WorkspaceGuard):
+        swapped_path: Path | None = None
+
+        def resolve(self, relative: str, must_exist: bool = False) -> Path:
+            normalized = relative.replace("\\", "/")
+            outer = root / "level1"
+            inner = outer / "level2"
+            if (
+                checkpoint == "outer_parent"
+                and normalized == "level1/level2"
+                and outer.is_dir()
+                and not inner.exists()
+                and self.swapped_path is None
+            ):
+                _replace_with_directory_link(outer, outside)
+                self.swapped_path = outer
+            elif (
+                checkpoint == "inner_parent"
+                and normalized == destination
+                and inner.is_dir()
+                and self.swapped_path is None
+            ):
+                _replace_with_directory_link(inner, outside)
+                self.swapped_path = inner
+            return super().resolve(relative, must_exist=must_exist)
+
+    guard = SwappingGuard(root)
+    tools = _tools_module().WorkspaceTools(
+        guard,
+        max_read_bytes=1024,
+        max_write_bytes=1024,
+    )
+    try:
+        if operation == "write":
+            result = tools.write_file(path=destination, content="blocked")
+        else:
+            result = tools.move_file(
+                source="source.txt",
+                destination=destination,
+            )
+
+        assert result.ok is False, f"{operation}/{checkpoint} unexpectedly succeeded"
+        assert result.error_code == "PATH_REJECTED", (
+            f"{operation}/{checkpoint} returned {result.error_code}"
+        )
+        assert list(outside.iterdir()) == [], (
+            f"{operation}/{checkpoint} created an outside artifact"
+        )
+        if operation == "move":
+            assert (root / "source.txt").read_text(
+                encoding="utf-8"
+            ) == "source"
+    finally:
+        if guard.swapped_path is not None:
+            _remove_directory_link(guard.swapped_path)
+
+    assert not (root / destination).exists()
+    assert not list(root.rglob("*.tmp"))
+
+
+def test_tool_schemas_match_exact_contract() -> None:
+    schemas = _tools_module().TOOL_SCHEMAS
+    expected_names = {
         "list_dir",
         "search_files",
         "read_file",
         "stat_path",
         "write_file",
         "move_file",
-    ]
-    assert len(schemas) == 6
-    for schema in schemas:
+    }
+    by_name = {
+        schema["function"]["name"]: schema
+        for schema in schemas
+    }
+    assert len(schemas) == 6, f"schema count was {len(schemas)}"
+    assert set(by_name) == expected_names, (
+        f"schema names were {sorted(by_name)}"
+    )
+
+    required = {
+        "list_dir": [],
+        "search_files": ["query"],
+        "read_file": ["path"],
+        "stat_path": ["path"],
+        "write_file": ["path", "content"],
+        "move_file": ["source", "destination"],
+    }
+    defaults = {
+        "list_dir": {
+            "path": ".",
+            "recursive": False,
+            "cursor": None,
+            "limit": 100,
+        },
+        "search_files": {
+            "path": ".",
+            "cursor": None,
+            "limit": 50,
+            "case_sensitive": True,
+        },
+        "read_file": {"offset": 0, "cursor": None},
+        "stat_path": {},
+        "write_file": {"overwrite": False},
+        "move_file": {},
+    }
+    numeric_bounds = {
+        "list_dir": {"limit": (1, 200)},
+        "search_files": {"limit": (1, 100)},
+        "read_file": {
+            "offset": (0, 2**63 - 1),
+            "limit": (1, 2**31 - 1),
+        },
+    }
+
+    for name in sorted(expected_names):
+        schema = by_name[name]
         parameters = schema["function"]["parameters"]
-        assert schema["type"] == "function"
-        assert parameters["type"] == "object"
-        assert parameters["additionalProperties"] is False
+        properties = parameters["properties"]
+        assert schema["type"] == "function", f"{name}.type"
+        assert parameters["type"] == "object", f"{name}.parameters.type"
+        assert parameters["additionalProperties"] is False, (
+            f"{name}.parameters.additionalProperties"
+        )
+        assert parameters["required"] == required[name], f"{name}.required"
+        actual_defaults = {
+            field: definition["default"]
+            for field, definition in properties.items()
+            if "default" in definition
+        }
+        assert actual_defaults == defaults[name], (
+            f"{name}.defaults were {actual_defaults!r}"
+        )
+        for field, (minimum, maximum) in numeric_bounds.get(
+            name,
+            {},
+        ).items():
+            assert properties[field]["minimum"] == minimum, (
+                f"{name}.{field}.minimum"
+            )
+            assert properties[field]["maximum"] == maximum, (
+                f"{name}.{field}.maximum"
+            )
 
-    read_properties = schemas[2]["function"]["parameters"]["properties"]
-    assert "cursor" in read_properties
-    assert {"type": "null"} in read_properties["cursor"]["anyOf"]
+    for name in ("list_dir", "search_files", "read_file"):
+        cursor = by_name[name]["function"]["parameters"]["properties"][
+            "cursor"
+        ]
+        cursor_types = {
+            choice["type"] for choice in cursor["anyOf"]
+        }
+        assert cursor_types == {"string", "null"}, f"{name}.cursor.anyOf"
 
-    serialized = json.dumps(schemas).lower()
-    for forbidden in ("root", "workspaceid", "delete", "shell"):
-        assert forbidden not in serialized
+    forbidden = {"root", "workspaceid", "shell", "delete"}
+
+    def assert_allowed_keys(value, location: str) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                assert key.lower() not in forbidden, f"{location}.{key}"
+                assert_allowed_keys(child, f"{location}.{key}")
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                assert_allowed_keys(child, f"{location}[{index}]")
+
+    assert_allowed_keys(schemas, "TOOL_SCHEMAS")
 
 
 def test_execute_dispatches_all_six_tools(tmp_path: Path) -> None:
