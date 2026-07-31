@@ -27,7 +27,6 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.websockets import WebSocketState
 
 from workspace_agent.config import Settings
 from workspace_agent.loop import AgentRunner
@@ -559,20 +558,6 @@ def _tool_http_error(error_code: str | None, message: str) -> HTTPException:
     )
 
 
-async def _send_failure(
-    socket: WebSocket,
-    message: str,
-    *,
-    close_code: int,
-) -> None:
-    try:
-        await socket.send_json({"type": "run_failed", "message": message})
-    except (RuntimeError, WebSocketDisconnect):
-        return
-    with suppress(RuntimeError, WebSocketDisconnect):
-        await socket.close(code=close_code)
-
-
 class _RunChannel:
     def __init__(self, socket: WebSocket) -> None:
         self._socket = socket
@@ -728,12 +713,12 @@ async def _send_channel_failure_bounded(
 
 async def _run_with_disconnect_monitor(
     socket: WebSocket,
+    channel: _RunChannel,
     runner: AgentRunner,
     task: str,
     *,
     max_run_seconds: float = 300.0,
 ) -> None:
-    channel = _RunChannel(socket)
     client_task = asyncio.create_task(_watch_client(socket))
     await asyncio.sleep(0)
     if client_task.done():
@@ -1061,42 +1046,42 @@ def create_app(
             await socket.close(code=1013, reason="connection limit exceeded")
             return
 
-        accepted = False
+        channel: _RunChannel | None = None
         run_slot_acquired = False
         workspace_acquired = False
         try:
             await socket.accept()
-            accepted = True
+            channel = _RunChannel(socket)
             try:
                 task = await _receive_run_task(socket)
             except WebSocketDisconnect:
                 return
             except (asyncio.TimeoutError, _InvalidRunRequest, RuntimeError):
-                await _send_failure(
-                    socket,
+                await _send_channel_failure_bounded(
+                    channel,
                     "Invalid run request",
                     close_code=1008,
                 )
                 return
 
             if app.state.model is None:
-                await _send_failure(
-                    socket,
+                await _send_channel_failure_bounded(
+                    channel,
                     "Model is not configured",
                     close_code=1011,
                 )
                 return
             if not app.state.run_slots.try_acquire():
-                await _send_failure(
-                    socket,
+                await _send_channel_failure_bounded(
+                    channel,
                     "Server is busy",
                     close_code=1013,
                 )
                 return
             run_slot_acquired = True
             if not app.state.workspace_lock.try_acquire():
-                await _send_failure(
-                    socket,
+                await _send_channel_failure_bounded(
+                    channel,
                     "Server is busy",
                     close_code=1013,
                 )
@@ -1111,6 +1096,7 @@ def create_app(
             )
             await _run_with_disconnect_monitor(
                 socket,
+                channel,
                 runner,
                 task,
                 max_run_seconds=configured.max_run_seconds,
@@ -1118,9 +1104,9 @@ def create_app(
         except WebSocketDisconnect:
             return
         except Exception:
-            if accepted and socket.application_state == WebSocketState.CONNECTED:
-                await _send_failure(
-                    socket,
+            if channel is not None:
+                await _send_channel_failure_bounded(
+                    channel,
                     "Run failed",
                     close_code=1011,
                 )

@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 from httpx import ASGITransport, AsyncClient
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from workspace_agent.config import Settings
 from workspace_agent.schemas import ModelReply, ToolCall, ToolResult, Usage
@@ -135,6 +135,47 @@ def post_reset(
 ):
     headers = {} if origin is None else {"origin": origin}
     return client.post("/api/reset", headers=headers)
+
+
+def websocket_route_endpoint(app):
+    return next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/ws/agent"
+    )
+
+
+class RouteSocket:
+    def __init__(
+        self,
+        first_frame: dict[str, Any],
+        *,
+        raise_after_send: bool = False,
+    ) -> None:
+        self.headers = {"origin": "http://testserver"}
+        self.client = SimpleNamespace(host="127.0.0.1")
+        self.application_state = WebSocketState.CONNECTING
+        self.first_frame = first_frame
+        self.raise_after_send = raise_after_send
+        self.accepted = False
+        self.sent: list[dict[str, Any]] = []
+        self.close_codes: list[int] = []
+
+    async def accept(self) -> None:
+        self.accepted = True
+        self.application_state = WebSocketState.CONNECTED
+
+    async def receive(self) -> dict[str, Any]:
+        return self.first_frame
+
+    async def send_json(self, event: dict[str, Any]) -> None:
+        self.sent.append(event)
+        if self.raise_after_send:
+            raise OSError("transport accepted event before failing")
+
+    async def close(self, code: int, reason: str = "") -> None:
+        self.close_codes.append(code)
+        self.application_state = WebSocketState.DISCONNECTED
 
 
 def test_index_assets_health_meta_tree_file_and_reset(tmp_path: Path) -> None:
@@ -481,6 +522,85 @@ def test_websocket_first_frame_accepts_only_strict_text_json_object(
     assert "NaN" not in serialized
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_message"),
+    [
+        ("invalid_frame", "Invalid run request"),
+        ("model_missing", "Model is not configured"),
+        ("run_slot_busy", "Server is busy"),
+        ("workspace_busy", "Server is busy"),
+    ],
+)
+async def test_route_early_failure_uses_one_terminal_after_send_oserror(
+    tmp_path: Path,
+    failure: str,
+    expected_message: str,
+) -> None:
+    settings = settings_for(tmp_path)
+    injected_model = None if failure == "model_missing" else FinalOnlyModel()
+    app = create_app(settings, model=injected_model)
+    frame = (
+        {"type": "websocket.receive", "text": "{}"}
+        if failure == "invalid_frame"
+        else {
+            "type": "websocket.receive",
+            "text": json.dumps({"type": "run", "task": "Inspect"}),
+        }
+    )
+    socket = RouteSocket(frame, raise_after_send=True)
+    held_gate = None
+    if failure == "run_slot_busy":
+        held_gate = app.state.run_slots
+    elif failure == "workspace_busy":
+        held_gate = app.state.workspace_lock
+    if held_gate is not None:
+        assert held_gate.try_acquire()
+
+    try:
+        try:
+            await websocket_route_endpoint(app)(socket)
+        except OSError:
+            pass
+    finally:
+        if held_gate is not None:
+            held_gate.release()
+
+    assert socket.accepted is True
+    assert socket.sent == [
+        {"type": "run_failed", "message": expected_message}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_route_outer_unexpected_error_sends_one_generic_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    async def fail_before_terminal(*args, **kwargs) -> None:
+        raise RuntimeError("unexpected route failure")
+
+    monkeypatch.setattr(
+        web,
+        "_run_with_disconnect_monitor",
+        fail_before_terminal,
+    )
+    app = create_app(settings_for(tmp_path), model=FinalOnlyModel())
+    socket = RouteSocket(
+        {
+            "type": "websocket.receive",
+            "text": json.dumps({"type": "run", "task": "Inspect"}),
+        }
+    )
+
+    await websocket_route_endpoint(app)(socket)
+
+    assert socket.sent == [{"type": "run_failed", "message": "Run failed"}]
+    assert socket.close_codes == [1011]
+
+
 def test_websocket_rejects_every_frame_after_the_run_request(
     tmp_path: Path,
 ) -> None:
@@ -537,8 +657,14 @@ async def test_queued_extra_frame_is_rejected_before_runner_starts() -> None:
 
     socket = ExtraFrameSocket()
     runner = NeverStartedRunner()
+    channel = web._RunChannel(socket)
 
-    await web._run_with_disconnect_monitor(socket, runner, "Inspect")
+    await web._run_with_disconnect_monitor(
+        socket,
+        channel,
+        runner,
+        "Inspect",
+    )
 
     assert runner.called is False
     assert socket.sent == [
@@ -580,9 +706,11 @@ async def test_runner_terminal_wins_a_simultaneous_extra_frame_and_latches() -> 
             await sink({"type": "run_failed", "message": "duplicate"})
 
     socket = RacingSocket()
+    channel = web._RunChannel(socket)
 
     await web._run_with_disconnect_monitor(
         socket,
+        channel,
         DuplicateTerminalRunner(),
         "Inspect",
     )
@@ -799,9 +927,11 @@ async def test_run_timeout_cancels_a_stuck_event_send() -> None:
             await sink({"type": "run_started"})
 
     socket = StuckSendSocket()
+    channel = web._RunChannel(socket)
     await asyncio.wait_for(
         web._run_with_disconnect_monitor(
             socket,
+            channel,
             EventOnlyRunner(),
             "Inspect",
             max_run_seconds=0.05,
@@ -856,12 +986,15 @@ async def test_repeated_cancellation_waits_for_runner_before_gate_release() -> N
     gate = web._CapacityGate(1)
     assert gate.try_acquire()
     runner = SettlingRunner()
+    socket = WaitingSocket()
+    channel = web._RunChannel(socket)
     order: list[str] = []
 
     async def run_with_gate() -> None:
         try:
             await web._run_with_disconnect_monitor(
-                WaitingSocket(),
+                socket,
+                channel,
                 runner,
                 "Inspect",
                 max_run_seconds=0.05,
