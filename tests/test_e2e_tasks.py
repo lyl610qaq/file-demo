@@ -139,7 +139,10 @@ def test_demo_seed_matches_clean_git_archive(
             )
     except FileNotFoundError:
         pytest.skip("git is unavailable; cannot verify the tracked seed asset")
-    assert archived.returncode == 0, archived.stderr.decode("utf-8")
+    stderr = archived.stderr.decode("utf-8", errors="replace")
+    if archived.returncode == 128:
+        pytest.skip("git archive cannot access HEAD: " + stderr)
+    assert archived.returncode == 0, stderr
     with tarfile.open(archive_path) as archive:
         archive.extractall(extracted, filter="data")
 

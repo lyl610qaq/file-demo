@@ -1856,7 +1856,7 @@ def test_create_app_restartably_finishes_interrupted_backup_restore(
     assert reset_artifacts(tmp_path) == []
 
 
-def test_create_app_refuses_empty_restored_workspace_without_backup(
+def test_create_app_refuses_empty_restored_workspace_with_non_seed_staging(
     tmp_path: Path,
 ) -> None:
     from workspace_agent import web
@@ -1865,6 +1865,9 @@ def test_create_app_refuses_empty_restored_workspace_without_backup(
     staging, backup = _backup_created_reset_state(settings)
     settings.workspace_root.mkdir()
     shutil.rmtree(backup)
+    shutil.rmtree(staging)
+    staging.mkdir()
+    (staging / "unexpected.md").write_text("unexpected", encoding="utf-8")
 
     with pytest.raises(
         ValueError,
@@ -1873,6 +1876,7 @@ def test_create_app_refuses_empty_restored_workspace_without_backup(
         create_app(settings, model=FinalOnlyModel())
 
     assert staging.is_dir()
+    assert (staging / "unexpected.md").is_file()
     assert (tmp_path / ".workspace-reset-journal.json").is_file()
     assert settings.workspace_root.is_dir()
     assert list(settings.workspace_root.iterdir()) == []
@@ -2239,6 +2243,118 @@ def test_v1_backup_created_recovery_preserves_empty_and_nonempty_workspaces(
     assert reset_artifacts(parent) == []
 
 
+def _empty_v1_backup_created_state(settings: Settings) -> tuple[Path, Path]:
+    parent = settings.workspace_root.parent
+    staging = parent / (".workspace-reset-stage-" + "a" * 32)
+    backup = parent / (".workspace-reset-backup-" + "b" * 32)
+    shutil.copytree(settings.seed_root, staging)
+    os.replace(settings.workspace_root, backup)
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=1,
+            phase="backup-created",
+        ),
+    )
+    return staging, backup
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "after-restore-rename",
+        "after-staging-cleanup",
+        "before-journal-cleanup",
+    ],
+)
+def test_v1_empty_backup_recovery_converges_after_second_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+) -> None:
+    from workspace_agent import web
+
+    settings = empty_settings_for(tmp_path)
+    parent = settings.workspace_root.parent
+    staging, backup = _empty_v1_backup_created_state(settings)
+
+    with monkeypatch.context() as patcher:
+        if checkpoint == "after-restore-rename":
+            original_replace = web.os.replace
+
+            def crash_after_restore_rename(
+                source: str | Path,
+                destination: str | Path,
+            ) -> None:
+                original_replace(source, destination)
+                if (
+                    Path(source) == backup
+                    and Path(destination) == settings.workspace_root
+                ):
+                    raise SimulatedCrash()
+
+            patcher.setattr(web.os, "replace", crash_after_restore_rename)
+        elif checkpoint == "after-staging-cleanup":
+            original_cleanup = web._cleanup_recovery_directory
+
+            def crash_after_staging_cleanup(path: Path, pattern) -> None:
+                original_cleanup(path, pattern)
+                if path == staging and settings.workspace_root.exists():
+                    raise SimulatedCrash()
+
+            patcher.setattr(
+                web,
+                "_cleanup_recovery_directory",
+                crash_after_staging_cleanup,
+            )
+        else:
+
+            def crash_before_journal_cleanup(path: Path) -> None:
+                raise SimulatedCrash()
+
+            patcher.setattr(
+                web,
+                "_remove_reset_journal",
+                crash_before_journal_cleanup,
+            )
+
+        with pytest.raises(SimulatedCrash):
+            web._recover_workspace_state(settings)
+
+    web._recover_workspace_state(settings)
+
+    assert list(settings.workspace_root.iterdir()) == []
+    assert reset_artifacts(parent) == []
+
+
+def test_v1_empty_recovery_rejects_non_seed_staging_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    from workspace_agent import web
+
+    settings = empty_settings_for(tmp_path)
+    parent = settings.workspace_root.parent
+    staging = parent / (".workspace-reset-stage-" + "a" * 32)
+    staging.mkdir()
+    (staging / "unexpected.md").write_text("unexpected", encoding="utf-8")
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=1,
+            phase="backup-created",
+        ),
+    )
+
+    with pytest.raises(ValueError, match="^workspace recovery failed$"):
+        web._recover_workspace_state(settings)
+
+    assert list(settings.workspace_root.iterdir()) == []
+    assert (staging / "unexpected.md").is_file()
+    assert (parent / ".workspace-reset-journal.json").is_file()
+
+
 @pytest.mark.parametrize("version", [1, 2])
 @pytest.mark.parametrize("workspace_was_empty", [False, True])
 def test_legacy_installed_recovery_restores_backup_before_discarding_it(
@@ -2275,6 +2391,80 @@ def test_legacy_installed_recovery_restores_backup_before_discarding_it(
             encoding="utf-8"
         ) == "body"
     assert reset_artifacts(parent) == []
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_installed_cleanup_finishes_when_backup_was_already_removed(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    parent = settings.workspace_root.parent
+    _, backup = _installed_seed_state(settings)
+    shutil.rmtree(backup)
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=version,
+            phase="workspace-installed",
+            workspace_was_empty=False,
+        ),
+    )
+
+    web._recover_workspace_state(settings)
+
+    assert (settings.workspace_root / "seed.md").read_text(
+        encoding="utf-8"
+    ) == "seed"
+    assert reset_artifacts(parent) == []
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_installed_cleanup_rejects_empty_workspace_without_backup(
+    tmp_path: Path,
+    version: int,
+) -> None:
+    from workspace_agent import web
+
+    settings = empty_settings_for(tmp_path)
+    parent = settings.workspace_root.parent
+    _write_raw_reset_journal(
+        parent,
+        _reset_journal_record(
+            settings,
+            version=version,
+            phase="workspace-installed",
+            workspace_was_empty=True,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="^workspace recovery failed$"):
+        web._recover_workspace_state(settings)
+
+    assert list(settings.workspace_root.iterdir()) == []
+    assert (parent / ".workspace-reset-journal.json").is_file()
+
+
+@pytest.mark.parametrize("phase", [[], {}, 1, True])
+def test_reset_journal_rejects_non_string_phase_with_value_error(
+    tmp_path: Path,
+    phase: object,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    record = _reset_journal_record(
+        settings,
+        version=1,
+        phase="prepared",
+    )
+    record["phase"] = phase
+
+    with pytest.raises(ValueError, match="^invalid reset journal$"):
+        web._validate_reset_journal_record(record, settings.workspace_root.name)
 
 
 def test_installed_empty_workspace_restores_valid_empty_backup_without_type_error(
@@ -2481,6 +2671,35 @@ def test_reset_records_v3_seed_fingerprint_before_workspace_exchange(
         _tree_digest_for_journal(settings.seed_root)
     }
     assert all(record["workspace_was_empty"] is False for record in records)
+
+
+def test_reset_restores_backup_when_installed_tree_changes_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    original_write = web._write_reset_journal
+
+    def write_then_mutate(parent: Path, record: dict[str, Any]) -> None:
+        original_write(parent, record)
+        if record["phase"] == "workspace-installed":
+            (settings.workspace_root / "seed.md").write_text(
+                "tampered",
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(web, "_write_reset_journal", write_then_mutate)
+
+    with pytest.raises(web._ResetError):
+        web._reset_workspace(settings)
+
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert not (settings.workspace_root / "seed.md").exists()
+    assert reset_artifacts(tmp_path) == []
 
 
 @pytest.mark.parametrize("corruption", ["zero-byte", "different", "partial"])

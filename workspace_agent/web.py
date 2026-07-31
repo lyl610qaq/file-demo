@@ -661,7 +661,8 @@ def _validate_reset_journal_record(
         or _RESET_BACKUP_PATTERN.fullmatch(normalized["backup"])
         is None
         or normalized["staging"] == normalized["backup"]
-        or normalized.get("phase") not in _RESET_PHASES
+        or not isinstance(normalized.get("phase"), str)
+        or normalized["phase"] not in _RESET_PHASES
     ):
         raise ValueError("invalid reset journal")
     return normalized
@@ -821,6 +822,24 @@ def _workspace_matches_seed_fingerprint(
     )
 
 
+def _can_finish_v1_empty_backup_restore(
+    record: dict[str, Any],
+    settings: Settings,
+    workspace: Path,
+    staging: Path,
+    *,
+    staging_exists: bool,
+) -> bool:
+    if record["version"] != 1 or record["phase"] != "backup-created":
+        return False
+    if _count_readable_regular_files(workspace) != 0:
+        return False
+    return not staging_exists or _physical_trees_equal(
+        staging,
+        settings.seed_root,
+    )
+
+
 def _restore_reset_backup(
     parent: Path,
     workspace: Path,
@@ -932,6 +951,20 @@ def _recover_journaled_reset(
             )
             return
         if workspace_exists:
+            if _can_finish_v1_empty_backup_restore(
+                record,
+                settings,
+                workspace,
+                staging,
+                staging_exists=staging_exists,
+            ):
+                _finish_restored_backup(
+                    parent,
+                    workspace,
+                    staging,
+                    allow_empty_workspace=True,
+                )
+                return
             _finish_restored_backup(
                 parent,
                 workspace,
@@ -950,6 +983,13 @@ def _recover_journaled_reset(
                 backup,
                 allow_empty_workspace=allow_empty_workspace,
             )
+            return
+        if workspace_exists and _count_readable_regular_files(workspace) > 0:
+            if staging_exists:
+                _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
+            _fsync_directory(parent)
+            _remove_reset_journal(parent)
+            _cleanup_journal_temps(parent)
             return
         raise ValueError("installed workspace cannot be verified")
 
@@ -1123,6 +1163,18 @@ def _reset_workspace(settings: Settings) -> None:
         raise _ResetError() from None
 
     try:
+        if not _workspace_matches_seed_fingerprint(
+            workspace,
+            journal["seed_fingerprint"],
+        ):
+            _restore_reset_backup(
+                parent,
+                workspace,
+                staging,
+                backup,
+                allow_empty_workspace=workspace_was_empty,
+            )
+            raise _ResetError()
         _cleanup_reset_path(backup)
         _fsync_directory(parent)
         _remove_reset_journal(parent)
