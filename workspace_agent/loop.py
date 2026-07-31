@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, TypeAlias
 
+from workspace_agent.model import validate_model_reply
 from workspace_agent.schemas import ModelReply, RunResult, ToolResult, Usage
 from workspace_agent.tools import TOOL_SCHEMAS, WorkspaceTools
 from workspace_agent.trace import TraceStore, TraceWriter
@@ -36,6 +37,15 @@ _EMPTY_REPLY_CORRECTION = (
 
 Event: TypeAlias = dict[str, Any]
 EventSink: TypeAlias = Callable[[Event], object | Awaitable[object]]
+_DEFAULT_PER_RESPONSE_TOOL_CALLS = 8
+_DEFAULT_TOTAL_TOOL_CALLS = 64
+_DEFAULT_AGGREGATE_RESULT_BYTES = 1024 * 1024
+_TOOL_ARGUMENT_ALLOWLIST = {
+    schema["function"]["name"]: frozenset(
+        schema["function"]["parameters"]["properties"]
+    )
+    for schema in TOOL_SCHEMAS
+}
 
 
 class ModelClient(Protocol):
@@ -59,17 +69,28 @@ class AgentRunner:
         tools: WorkspaceTools,
         traces: TraceStore,
         max_model_calls: int,
+        *,
+        per_response_tool_calls: int = _DEFAULT_PER_RESPONSE_TOOL_CALLS,
+        total_tool_calls: int = _DEFAULT_TOTAL_TOOL_CALLS,
+        aggregate_result_bytes: int = _DEFAULT_AGGREGATE_RESULT_BYTES,
     ) -> None:
-        if (
-            not isinstance(max_model_calls, int)
-            or isinstance(max_model_calls, bool)
-            or max_model_calls < 1
-        ):
-            raise ValueError("max_model_calls must be a positive integer")
+        _require_positive_limit("max_model_calls", max_model_calls)
+        _require_positive_limit(
+            "per_response_tool_calls",
+            per_response_tool_calls,
+        )
+        _require_positive_limit("total_tool_calls", total_tool_calls)
+        _require_positive_limit(
+            "aggregate_result_bytes",
+            aggregate_result_bytes,
+        )
         self._model = model
         self._tools = tools
         self._traces = traces
         self._max_model_calls = max_model_calls
+        self._per_response_tool_calls = per_response_tool_calls
+        self._total_tool_calls = total_tool_calls
+        self._aggregate_result_bytes = aggregate_result_bytes
 
     async def run(self, task: str, sink: EventSink) -> RunResult:
         if not isinstance(task, str) or not task.strip():
@@ -104,6 +125,9 @@ class AgentRunner:
         step = 0
         previous_signature: str | None = None
         consecutive_signatures = 0
+        signature_counts: dict[str, int] = {}
+        total_tool_calls = 0
+        aggregate_result_bytes = 0
 
         await _emit(sink, {"type": "run_started", "run_id": run_id})
 
@@ -127,7 +151,9 @@ class AgentRunner:
                 },
             )
             try:
-                reply = await self._model.complete(messages, TOOL_SCHEMAS)
+                reply = validate_model_reply(
+                    await self._model.complete(messages, TOOL_SCHEMAS)
+                )
             except Exception as error:
                 return await self._fail(
                     run_id,
@@ -151,6 +177,28 @@ class AgentRunner:
 
             if reply.tool_calls:
                 empty_replies = 0
+                response_tool_calls = len(reply.tool_calls)
+                if response_tool_calls > self._per_response_tool_calls:
+                    return await self._fail(
+                        run_id,
+                        "Response tool call limit reached",
+                        model_calls,
+                        usage,
+                        sink,
+                    )
+                if (
+                    total_tool_calls + response_tool_calls
+                    > self._total_tool_calls
+                ):
+                    return await self._fail(
+                        run_id,
+                        "Total tool call limit reached",
+                        model_calls,
+                        usage,
+                        sink,
+                    )
+                total_tool_calls += response_tool_calls
+
                 for call in reply.tool_calls:
                     signature = _tool_signature(
                         call.name,
@@ -162,7 +210,13 @@ class AgentRunner:
                         previous_signature = signature
                         consecutive_signatures = 1
 
-                    if consecutive_signatures >= 3:
+                    signature_counts[signature] = (
+                        signature_counts.get(signature, 0) + 1
+                    )
+                    if (
+                        consecutive_signatures >= 3
+                        or signature_counts[signature] >= 3
+                    ):
                         return await self._fail(
                             run_id,
                             "Repeated tool call limit reached",
@@ -190,6 +244,19 @@ class AgentRunner:
                     result = await self._execute_tool(
                         call.name,
                         call.arguments,
+                        on_cancelled=lambda: writer.append(
+                            step=step,
+                            tool=call.name,
+                            args=_safe_trace_args(
+                                call.name,
+                                call.arguments,
+                                visible_args,
+                            ),
+                            result_summary=(
+                                "Tool execution settled after run cancellation"
+                            ),
+                            status="cancelled",
+                        ),
                     )
 
                     status = "success" if result.ok else "error"
@@ -215,14 +282,39 @@ class AgentRunner:
                             "result_summary": result.summary,
                         },
                     )
+                    try:
+                        model_payload = json.dumps(
+                            result.model_payload(),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        )
+                    except (TypeError, ValueError):
+                        return await self._fail(
+                            run_id,
+                            "Tool result serialization failed",
+                            model_calls,
+                            usage,
+                            sink,
+                        )
+                    aggregate_result_bytes += len(
+                        model_payload.encode("utf-8")
+                    )
+                    if (
+                        aggregate_result_bytes
+                        > self._aggregate_result_bytes
+                    ):
+                        return await self._fail(
+                            run_id,
+                            "Tool result byte budget exceeded",
+                            model_calls,
+                            usage,
+                            sink,
+                        )
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": call.id,
-                            "content": json.dumps(
-                                result.model_payload(),
-                                ensure_ascii=False,
-                            ),
+                            "content": model_payload,
                         }
                     )
                 continue
@@ -274,13 +366,30 @@ class AgentRunner:
         self,
         name: str,
         arguments: dict[str, Any],
+        *,
+        on_cancelled: Callable[[], None],
     ) -> ToolResult:
-        try:
-            return await asyncio.to_thread(
+        worker = asyncio.create_task(
+            asyncio.to_thread(
                 self._tools.execute,
                 name,
                 arguments,
             )
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if worker.done() and not worker.cancelled():
+                worker.exception()
+            on_cancelled()
+            raise
         except Exception as error:
             return ToolResult(
                 ok=False,
@@ -329,11 +438,20 @@ def _tool_signature(name: str, arguments: dict[str, Any]) -> str:
     return f"{name}:{canonical}"
 
 
+def _require_positive_limit(name: str, value: int) -> None:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 1
+    ):
+        raise ValueError(f"{name} must be a positive integer")
+
+
 def _safe_event_args(
     tool: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    sanitized = dict(arguments)
+    sanitized = _allowlisted_arguments(tool, arguments)
     if tool != "write_file":
         return sanitized
 
@@ -370,9 +488,29 @@ def _safe_trace_args(
     arguments: dict[str, Any],
     visible_args: dict[str, Any],
 ) -> dict[str, Any]:
-    if tool != "write_file" or isinstance(arguments.get("content"), str):
-        return arguments
+    allowed = _allowlisted_arguments(tool, arguments)
+    if tool != "write_file" or isinstance(allowed.get("content"), str):
+        return allowed
 
     trace_args = dict(visible_args)
     trace_args["content"] = ""
     return trace_args
+
+
+def _allowlisted_arguments(
+    tool: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    allowed = _TOOL_ARGUMENT_ALLOWLIST.get(tool, ())
+    sanitized: dict[str, Any] = {}
+    for name in allowed:
+        if name not in arguments:
+            continue
+        encoded = json.dumps(
+            arguments[name],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        sanitized[name] = json.loads(encoded)
+    return sanitized

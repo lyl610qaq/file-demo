@@ -1,6 +1,8 @@
+import asyncio
 import copy
 import hashlib
 import json
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -93,7 +95,7 @@ async def test_model_sends_exact_request_and_parses_final_reply() -> None:
 
 
 @pytest.mark.asyncio
-async def test_model_parses_multiple_tool_calls_and_preserves_raw_message() -> None:
+async def test_model_parses_multiple_tool_calls_into_canonical_message() -> None:
     message = {
         "role": "assistant",
         "content": None,
@@ -124,7 +126,28 @@ async def test_model_parses_multiple_tool_calls_and_preserves_raw_message() -> N
     finally:
         await client.aclose()
 
-    assert reply.message is message or reply.message == message
+    assert reply.message == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"limit":20,"path":"notes/资料.txt"}',
+                },
+            },
+            {
+                "id": "call-2",
+                "type": "function",
+                "function": {
+                    "name": "stat_path",
+                    "arguments": '{"path":"notes"}',
+                },
+            },
+        ],
+    }
     assert reply.tool_calls == (
         ToolCall(
             id="call-1",
@@ -255,6 +278,56 @@ async def test_model_missing_usage_marks_every_component_unknown() -> None:
                 ],
             }
         ),
+        _completion({"role": "user", "content": "not allowed"}),
+        _completion({"role": "assistant", "content": ["not", "text"]}),
+        _completion(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "not-function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            }
+        ),
+        _completion(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "duplicate",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{}",
+                        },
+                    },
+                    {
+                        "id": "duplicate",
+                        "type": "function",
+                        "function": {
+                            "name": "stat_path",
+                            "arguments": "{}",
+                        },
+                    },
+                ],
+            }
+        ),
+        _completion(
+            {"role": "assistant", "content": "bad usage"},
+            usage={
+                "prompt_tokens": -1,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -269,6 +342,80 @@ async def test_model_rejects_malformed_response_shapes(
             await model.complete([], [])
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_model_normalizes_null_fields_and_owns_canonical_message() -> None:
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": None,
+                    "ignored_secret": "must-not-survive",
+                }
+            }
+        ],
+        "usage": None,
+    }
+    model, client = _injected_model(
+        lambda request: httpx.Response(200, json=payload)
+    )
+    try:
+        reply = await model.complete([], [])
+    finally:
+        await client.aclose()
+
+    assert reply.message == {"role": "assistant", "content": None}
+    assert reply.tool_calls == ()
+    assert reply.usage == Usage(None, None, None)
+    assert "ignored_secret" not in json.dumps(reply.message)
+
+
+@pytest.mark.asyncio
+async def test_model_builds_canonical_tool_call_message() -> None:
+    payload = _completion(
+        {
+            "role": "assistant",
+            "content": None,
+            "ignored": "drop-me",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "ignored": "drop-me-too",
+                    "function": {
+                        "name": "stat_path",
+                        "arguments": '{"z":1,"a":2}',
+                        "ignored": "drop-me-three",
+                    },
+                }
+            ],
+        }
+    )
+    model, client = _injected_model(
+        lambda request: httpx.Response(200, json=payload)
+    )
+    try:
+        reply = await model.complete([], [])
+    finally:
+        await client.aclose()
+
+    assert reply.message == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "stat_path",
+                    "arguments": '{"a":2,"z":1}',
+                },
+            }
+        ],
+    }
 
 
 @pytest.mark.parametrize("failure_kind", ["timeout", "network", "429", "500"])
@@ -310,7 +457,42 @@ async def test_model_retries_transient_failures(
     assert reply.message["content"] == "Recovered"
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 600])
+@pytest.mark.parametrize("status", [408, 425, 429, 500, 502, 503, 504])
+@pytest.mark.asyncio
+async def test_model_retries_only_explicit_retryable_statuses(
+    status: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    async def record_delay(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr("workspace_agent.model.asyncio.sleep", record_delay)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(status, text="retry")
+        return httpx.Response(
+            200,
+            json=_completion({"role": "assistant", "content": "Recovered"}),
+        )
+
+    model, client = _injected_model(handler)
+    try:
+        reply = await model.complete([], [])
+    finally:
+        await client.aclose()
+
+    assert attempts == 2
+    assert delays == [0.05]
+    assert reply.message["content"] == "Recovered"
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 501, 505, 599, 600])
 @pytest.mark.asyncio
 async def test_model_does_not_retry_nonretryable_client_errors(
     status: int,
@@ -332,6 +514,51 @@ async def test_model_does_not_retry_nonretryable_client_errors(
     assert attempts == 1
     assert "never-print-this-key" not in str(captured.value)
     assert "sensitive response body" not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "retry_after",
+    [
+        "NaN",
+        "Infinity",
+        "-1",
+        "Wed, 21 Oct 2015 07:28:00 GMT",
+    ],
+)
+@pytest.mark.asyncio
+async def test_model_invalid_retry_after_uses_deterministic_backoff(
+    retry_after: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    async def record_delay(seconds: float) -> None:
+        delays.append(seconds)
+
+    monkeypatch.setattr("workspace_agent.model.asyncio.sleep", record_delay)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": retry_after},
+            )
+        return httpx.Response(
+            200,
+            json=_completion({"role": "assistant", "content": "Recovered"}),
+        )
+
+    model, client = _injected_model(handler)
+    try:
+        await model.complete([], [])
+    finally:
+        await client.aclose()
+
+    assert attempts == 2
+    assert delays == [0.05]
 
 
 @pytest.mark.asyncio
@@ -454,6 +681,36 @@ class CountingWorkspaceTools(WorkspaceTools):
     ):
         self.executed.append((name, copy.deepcopy(arguments)))
         return super().execute(name, arguments)
+
+
+class BlockingWorkspaceTools(WorkspaceTools):
+    def __init__(
+        self,
+        guard: WorkspaceGuard,
+        *,
+        max_read_bytes: int,
+        max_write_bytes: int,
+    ) -> None:
+        super().__init__(
+            guard,
+            max_read_bytes=max_read_bytes,
+            max_write_bytes=max_write_bytes,
+        )
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def execute(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ):
+        self.started.set()
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("test worker was not released")
+        result = super().execute(name, arguments)
+        self.finished.set()
+        return result
 
 
 def _workspace_tools(
@@ -614,7 +871,20 @@ async def test_agent_loop_executes_tool_then_final_and_closes_trace(
         {"role": "system", "content": SYSTEM_POLICY},
         {"role": "user", "content": "Read note.txt"},
     ]
-    assert second_messages[2] == raw_tool_message.message
+    assert second_messages[2] == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"limit":100,"path":"note.txt"}',
+                },
+            }
+        ],
+    }
     assert second_messages[3]["role"] == "tool"
     assert second_messages[3]["tool_call_id"] == "call-1"
     tool_payload = json.loads(second_messages[3]["content"])
@@ -786,6 +1056,131 @@ async def test_agent_loop_blocks_third_identical_consecutive_tool_execution(
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_rejects_oversized_single_tool_call_response(
+    tmp_path: Path,
+) -> None:
+    calls = tuple(
+        ToolCall(
+            f"call-{number}",
+            "stat_path",
+            {"path": f"missing-{number}.txt"},
+        )
+        for number in range(9)
+    )
+    model = ScriptedModel(_tool_reply(*calls))
+    tools = _workspace_tools(tmp_path, CountingWorkspaceTools)
+    events: list[dict[str, Any]] = []
+
+    result = await AgentRunner(
+        model,
+        tools,
+        RecordingTraceStore(tmp_path / "traces"),
+        max_model_calls=2,
+    ).run("Inspect many paths", events.append)
+
+    assert result.status == "failed"
+    assert "response tool call limit" in result.message.lower()
+    assert isinstance(tools, CountingWorkspaceTools)
+    assert tools.executed == []
+    assert len(model.calls) == 1
+    assert events[-1]["type"] == "run_failed"
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_stops_before_exceeding_total_tool_call_limit(
+    tmp_path: Path,
+) -> None:
+    model = ScriptedModel(
+        _tool_reply(ToolCall("call-1", "stat_path", {"path": "."})),
+        _tool_reply(
+            ToolCall("call-2", "stat_path", {"path": "missing-1.txt"})
+        ),
+        _tool_reply(
+            ToolCall("call-3", "stat_path", {"path": "missing-2.txt"})
+        ),
+    )
+    tools = _workspace_tools(tmp_path, CountingWorkspaceTools)
+
+    result = await AgentRunner(
+        model,
+        tools,
+        RecordingTraceStore(tmp_path / "traces"),
+        max_model_calls=4,
+        total_tool_calls=2,
+    ).run("Inspect paths", lambda event: None)
+
+    assert result.status == "failed"
+    assert "total tool call limit" in result.message.lower()
+    assert isinstance(tools, CountingWorkspaceTools)
+    assert len(tools.executed) == 2
+    assert len(model.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_blocks_third_global_signature_in_alternating_pattern(
+    tmp_path: Path,
+) -> None:
+    call_a = lambda number: _tool_reply(
+        ToolCall(f"call-a-{number}", "stat_path", {"path": "a.txt"})
+    )
+    call_b = lambda number: _tool_reply(
+        ToolCall(f"call-b-{number}", "stat_path", {"path": "b.txt"})
+    )
+    model = ScriptedModel(
+        call_a(1),
+        call_b(1),
+        call_a(2),
+        call_b(2),
+        call_a(3),
+        _final_reply("must not be reached"),
+    )
+    tools = _workspace_tools(tmp_path, CountingWorkspaceTools)
+
+    result = await AgentRunner(
+        model,
+        tools,
+        RecordingTraceStore(tmp_path / "traces"),
+        max_model_calls=7,
+    ).run("Inspect alternating paths", lambda event: None)
+
+    assert result.status == "failed"
+    assert "repeated" in result.message.lower()
+    assert isinstance(tools, CountingWorkspaceTools)
+    assert len(tools.executed) == 4
+    assert len(model.calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_stops_after_tool_result_byte_budget_is_exceeded(
+    tmp_path: Path,
+) -> None:
+    model = ScriptedModel(
+        _tool_reply(
+            ToolCall("call-1", "stat_path", {"path": "missing-1.txt"})
+        ),
+        _tool_reply(
+            ToolCall("call-2", "stat_path", {"path": "missing-2.txt"})
+        ),
+        _final_reply("must not be reached"),
+    )
+    tools = _workspace_tools(tmp_path, CountingWorkspaceTools)
+
+    result = await AgentRunner(
+        model,
+        tools,
+        RecordingTraceStore(tmp_path / "traces"),
+        max_model_calls=4,
+        aggregate_result_bytes=150,
+    ).run("Inspect root", lambda event: None)
+
+    assert result.status == "failed"
+    assert "result byte budget" in result.message.lower()
+    assert isinstance(tools, CountingWorkspaceTools)
+    assert len(tools.executed) == 2
+    assert len(model.calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_retries_two_empty_replies_then_succeeds(
     tmp_path: Path,
 ) -> None:
@@ -910,6 +1305,106 @@ async def test_agent_loop_sanitizes_model_exception(
     assert "private-body" not in serialized
 
 
+@pytest.mark.parametrize(
+    "reply",
+    [
+        ModelReply(message={"role": "user", "content": "bad role"}),
+        ModelReply(
+            message={
+                "role": "assistant",
+                "content": {"secret": "bad content"},
+            }
+        ),
+        ModelReply(
+            message={"role": "assistant", "content": "bad usage"},
+            usage=Usage(-1, 0, 0),
+        ),
+        ModelReply(
+            message={
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "not-function",
+                        "function": {
+                            "name": "stat_path",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            },
+            tool_calls=(
+                ToolCall("call-1", "stat_path", {}),
+            ),
+        ),
+        ModelReply(
+            message={
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": '{"offset":NaN}',
+                        },
+                    }
+                ],
+            },
+            tool_calls=(
+                ToolCall("call-1", "read_file", {"offset": float("nan")}),
+            ),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_loop_converts_malformed_model_reply_to_run_failed(
+    tmp_path: Path,
+    reply: ModelReply,
+) -> None:
+    events: list[dict[str, Any]] = []
+
+    result = await AgentRunner(
+        ScriptedModel(reply),
+        _workspace_tools(tmp_path),
+        RecordingTraceStore(tmp_path / "traces"),
+        max_model_calls=2,
+    ).run("Inspect root", events.append)
+
+    assert result.status == "failed"
+    assert result.message == "Model call failed: ModelProtocolError"
+    assert result.model_calls == 1
+    assert events[-1]["type"] == "run_failed"
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_normalizes_nullable_reply_from_injected_model(
+    tmp_path: Path,
+) -> None:
+    reply = ModelReply(
+        message={
+            "role": "assistant",
+            "content": "Done",
+            "tool_calls": None,
+        },
+        tool_calls=None,  # type: ignore[arg-type]
+        usage=None,  # type: ignore[arg-type]
+    )
+
+    result = await AgentRunner(
+        ScriptedModel(reply),
+        _workspace_tools(tmp_path),
+        RecordingTraceStore(tmp_path / "traces"),
+        max_model_calls=2,
+    ).run("Finish", lambda event: None)
+
+    assert result.status == "completed"
+    assert result.message == "Done"
+    assert result.usage == Usage(None, None, None)
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_accepts_async_event_sink(tmp_path: Path) -> None:
     events: list[dict[str, Any]] = []
@@ -971,6 +1466,49 @@ async def test_agent_loop_propagates_sink_failure_and_closes_trace(
         )
 
 
+@pytest.mark.asyncio
+async def test_agent_loop_waits_for_tool_worker_before_propagating_cancel(
+    tmp_path: Path,
+) -> None:
+    tools = _workspace_tools(tmp_path, BlockingWorkspaceTools)
+    assert isinstance(tools, BlockingWorkspaceTools)
+    traces = RecordingTraceStore(tmp_path / "traces")
+    runner_task = asyncio.create_task(
+        AgentRunner(
+            ScriptedModel(
+                _tool_reply(
+                    ToolCall("call-1", "stat_path", {"path": "."})
+                )
+            ),
+            tools,
+            traces,
+            max_model_calls=2,
+        ).run("Inspect root", lambda event: None)
+    )
+
+    assert await asyncio.to_thread(tools.started.wait, 2)
+    writer = traces.writers[0]
+    runner_task.cancel()
+    try:
+        await asyncio.sleep(0.05)
+        assert not runner_task.done()
+        assert not writer._handle.closed
+    finally:
+        tools.release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner_task
+
+    assert tools.finished.is_set()
+    assert writer._handle.closed
+    record = json.loads(writer.path.read_text(encoding="utf-8"))
+    assert record["status"] == "cancelled"
+    assert record["result_summary"] == (
+        "Tool execution settled after run cancellation"
+    )
+    assert "data" not in record["result_summary"].lower()
+
+
 def test_system_policy_is_generic_and_marks_injection_boundary() -> None:
     assert "only the user's task" in SYSTEM_POLICY
     assert "UNTRUSTED_WORKSPACE_DATA" in SYSTEM_POLICY
@@ -1028,6 +1566,61 @@ async def test_agent_loop_sanitizes_write_content_in_events_and_trace(
     assert trace_record["args"] == started["args"]
     assert content not in json.dumps(events, ensure_ascii=False)
     assert content not in traces.writers[0].path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_drops_unknown_tool_arguments_from_events_and_trace(
+    tmp_path: Path,
+) -> None:
+    content = "safe content"
+    secret = "unknown-metadata-secret"
+    call = ToolCall(
+        "call-write",
+        "write_file",
+        {
+            "path": "created.txt",
+            "content": content,
+            "overwrite": False,
+            "metadata": {"secret": secret},
+            "secret": secret,
+        },
+    )
+    events: list[dict[str, Any]] = []
+    traces = RecordingTraceStore(tmp_path / "traces")
+    model = ScriptedModel(
+        _tool_reply(call),
+        _final_reply("Recovered from unknown arguments."),
+    )
+
+    result = await AgentRunner(
+        model,
+        _workspace_tools(tmp_path),
+        traces,
+        max_model_calls=3,
+    ).run("Create a file", events.append)
+
+    assert result.status == "completed"
+    expected_args = {
+        "path": "created.txt",
+        "overwrite": False,
+        "content_bytes": len(content.encode("utf-8")),
+        "content_sha256": hashlib.sha256(
+            content.encode("utf-8")
+        ).hexdigest(),
+    }
+    started = next(
+        event for event in events if event["type"] == "tool_started"
+    )
+    assert started["args"] == expected_args
+    finished = next(
+        event for event in events if event["type"] == "tool_finished"
+    )
+    assert finished["ok"] is False
+    trace_text = traces.writers[0].path.read_text(encoding="utf-8")
+    trace_record = json.loads(trace_text)
+    assert trace_record["args"] == expected_args
+    assert secret not in json.dumps(events, ensure_ascii=False)
+    assert secret not in trace_text
 
 
 @pytest.mark.parametrize(
