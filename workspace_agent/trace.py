@@ -11,6 +11,9 @@ from typing import Any, IO
 
 
 MAX_RUN_ID_LENGTH = 64
+_TERMINAL_RUN_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "interrupted"}
+)
 _RUN_ID_PATTERN = re.compile(
     rf"[A-Za-z0-9-]{{1,{MAX_RUN_ID_LENGTH}}}",
     flags=re.ASCII,
@@ -41,6 +44,7 @@ class TraceWriter:
             encoding="utf-8",
             newline="\n",
         )
+        self._terminal_status_written = False
 
     def append(
         self,
@@ -71,31 +75,42 @@ class TraceWriter:
         model_calls: int,
         usage: dict[str, int | None],
     ) -> None:
-        if status not in {"completed", "failed"}:
-            raise ValueError("invalid run status")
-        self._append_record(
-            {
-                "type": "run_status",
-                "status": status,
-                "model_calls": model_calls,
-                "usage": dict(usage),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        if status not in _TERMINAL_RUN_STATUSES:
+            raise ValueError("invalid terminal run status")
+        record = {
+            "type": "run_status",
+            "status": status,
+            "model_calls": model_calls,
+            "usage": dict(usage),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        line = self._serialize_record(record)
+        with self._lock:
+            if self._terminal_status_written:
+                raise ValueError("terminal run status already recorded")
+            self._write_line_locked(line)
+            self._terminal_status_written = True
 
     def _append_record(self, record: dict[str, Any]) -> None:
-        line = json.dumps(
+        line = self._serialize_record(record)
+        with self._lock:
+            self._write_line_locked(line)
+
+    @staticmethod
+    def _serialize_record(record: dict[str, Any]) -> str:
+        return json.dumps(
             record,
             ensure_ascii=False,
             separators=(",", ":"),
             allow_nan=False,
         )
-        with self._lock:
-            if self._handle.closed:
-                raise ValueError("trace writer is closed")
-            self._handle.write(line)
-            self._handle.write("\n")
-            self._handle.flush()
+
+    def _write_line_locked(self, line: str) -> None:
+        if self._handle.closed:
+            raise ValueError("trace writer is closed")
+        self._handle.write(line)
+        self._handle.write("\n")
+        self._handle.flush()
 
     def close(self) -> None:
         with self._lock:

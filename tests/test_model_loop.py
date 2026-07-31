@@ -659,6 +659,26 @@ class RecordingTraceStore(TraceStore):
         return writer
 
 
+class FailingRunStatusWriter(TraceWriter):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.status_attempts = 0
+
+    def append_run_status(self, **kwargs: Any) -> None:
+        self.status_attempts += 1
+        super().append_run_status(**kwargs)
+        raise RuntimeError("trace status write failed")
+
+
+class FailingRunStatusStore(RecordingTraceStore):
+    def create(self, run_id: str) -> TraceWriter:
+        path = self.path_for(run_id)
+        handle = path.open("x", encoding="utf-8", newline="\n")
+        writer = FailingRunStatusWriter(path, threading.Lock(), handle)
+        self.writers.append(writer)
+        return writer
+
+
 class CountingWorkspaceTools(WorkspaceTools):
     def __init__(
         self,
@@ -989,11 +1009,12 @@ async def test_agent_loop_accumulates_usage_and_propagates_unknowns(
         ),
     )
     events: list[dict[str, Any]] = []
+    traces = RecordingTraceStore(tmp_path / "traces")
 
     result = await AgentRunner(
         model,
         _workspace_tools(tmp_path),
-        RecordingTraceStore(tmp_path / "traces"),
+        traces,
         max_model_calls=3,
     ).run("Inspect the root", events.append)
 
@@ -1290,11 +1311,12 @@ async def test_agent_loop_sanitizes_model_exception(
         )
     )
     events: list[dict[str, Any]] = []
+    traces = RecordingTraceStore(tmp_path / "traces")
 
     result = await AgentRunner(
         model,
         _workspace_tools(tmp_path),
-        RecordingTraceStore(tmp_path / "traces"),
+        traces,
         max_model_calls=2,
     ).run("Inspect root", events.append)
 
@@ -1324,6 +1346,14 @@ async def test_agent_loop_sanitizes_model_exception(
     assert "sk-private" not in serialized
     assert "C:/secret" not in serialized
     assert "private-body" not in serialized
+    trace_records = [
+        json.loads(line)
+        for line in traces.writers[0].path.read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+    assert [record["status"] for record in trace_records] == ["failed"]
+    assert trace_records[0]["model_calls"] == 1
 
 
 @pytest.mark.parametrize(
@@ -1487,6 +1517,157 @@ async def test_agent_loop_propagates_sink_failure_and_closes_trace(
         )
 
 
+@pytest.mark.parametrize(
+    ("failure_event", "expected_model_calls", "expected_usage"),
+    [
+        (
+            "run_started",
+            0,
+            {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        ),
+        (
+            "model_call_started",
+            1,
+            {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        ),
+        (
+            "assistant_message",
+            1,
+            {
+                "prompt_tokens": 2,
+                "completion_tokens": 3,
+                "total_tokens": 5,
+            },
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_loop_records_interrupted_status_for_sink_failures(
+    tmp_path: Path,
+    failure_event: str,
+    expected_model_calls: int,
+    expected_usage: dict[str, int],
+) -> None:
+    class SinkDisconnected(Exception):
+        pass
+
+    def sink(event: dict[str, Any]) -> None:
+        if event["type"] == failure_event:
+            raise SinkDisconnected(
+                "api-key=sink-secret path=C:/private"
+            )
+
+    traces = RecordingTraceStore(tmp_path / "traces")
+    runner = AgentRunner(
+        ScriptedModel(
+            _final_reply("Done", usage=Usage(2, 3, 5))
+        ),
+        _workspace_tools(tmp_path),
+        traces,
+        max_model_calls=2,
+    )
+
+    with pytest.raises(SinkDisconnected):
+        await runner.run("Finish", sink)
+
+    writer = traces.writers[0]
+    records = [
+        json.loads(line)
+        for line in writer.path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert records == [
+        {
+            "type": "run_status",
+            "status": "interrupted",
+            "model_calls": expected_model_calls,
+            "usage": expected_usage,
+            "timestamp": records[0]["timestamp"],
+        }
+    ]
+    assert writer._handle.closed
+    serialized = json.dumps(records)
+    assert "sink-secret" not in serialized
+    assert "C:/private" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_records_cancelled_status_during_model_call(
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+
+    class BlockingModel:
+        async def complete(self, messages, tools):
+            started.set()
+            await asyncio.Event().wait()
+
+    traces = RecordingTraceStore(tmp_path / "traces")
+    task = asyncio.create_task(
+        AgentRunner(
+            BlockingModel(),
+            _workspace_tools(tmp_path),
+            traces,
+            max_model_calls=2,
+        ).run("Wait", lambda event: None)
+    )
+    await asyncio.wait_for(started.wait(), timeout=2)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    writer = traces.writers[0]
+    records = [
+        json.loads(line)
+        for line in writer.path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["status"] for record in records] == ["cancelled"]
+    assert records[0]["model_calls"] == 1
+    assert records[0]["usage"] == Usage().as_dict()
+    assert writer._handle.closed
+
+
+@pytest.mark.asyncio
+async def test_run_status_failure_is_not_retried_or_allowed_to_mask_sink_error(
+    tmp_path: Path,
+) -> None:
+    class SinkDisconnected(Exception):
+        pass
+
+    def sink(event: dict[str, Any]) -> None:
+        if event["type"] == "run_started":
+            raise SinkDisconnected("browser disconnected")
+
+    traces = FailingRunStatusStore(tmp_path / "traces")
+    runner = AgentRunner(
+        ScriptedModel(_final_reply("unused")),
+        _workspace_tools(tmp_path),
+        traces,
+        max_model_calls=2,
+    )
+
+    with pytest.raises(SinkDisconnected):
+        await runner.run("Finish", sink)
+
+    writer = traces.writers[0]
+    assert isinstance(writer, FailingRunStatusWriter)
+    assert writer.status_attempts == 1
+    records = [
+        json.loads(line)
+        for line in writer.path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["status"] for record in records] == ["interrupted"]
+    assert writer._handle.closed
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_waits_for_tool_worker_before_propagating_cancel(
     tmp_path: Path,
@@ -1522,11 +1703,18 @@ async def test_agent_loop_waits_for_tool_worker_before_propagating_cancel(
 
     assert tools.finished.is_set()
     assert writer._handle.closed
-    record = json.loads(writer.path.read_text(encoding="utf-8"))
+    records = [
+        json.loads(line)
+        for line in writer.path.read_text(encoding="utf-8").splitlines()
+    ]
+    record, terminal = records
     assert record["status"] == "success_after_cancel"
     assert record["result_summary"] == "Inspected ."
     assert "error_code" not in record
     assert "data" not in record["result_summary"].lower()
+    assert terminal["status"] == "cancelled"
+    assert terminal["model_calls"] == 1
+    assert terminal["usage"] == Usage().as_dict()
 
 
 @pytest.mark.asyncio
@@ -1571,7 +1759,11 @@ async def test_agent_loop_records_committed_write_after_cancel(
     assert (tools.guard.root / "committed.txt").read_text(
         encoding="utf-8"
     ) == content
-    record = json.loads(writer.path.read_text(encoding="utf-8"))
+    records = [
+        json.loads(line)
+        for line in writer.path.read_text(encoding="utf-8").splitlines()
+    ]
+    record, terminal = records
     assert record["status"] == "success_after_cancel"
     assert record["result_summary"] == (
         f"Wrote {len(content.encode('utf-8'))} bytes to committed.txt"
@@ -1586,6 +1778,9 @@ async def test_agent_loop_records_committed_write_after_cancel(
     }
     assert "content" not in record["args"]
     assert "error_code" not in record
+    assert terminal["status"] == "cancelled"
+    assert terminal["model_calls"] == 1
+    assert terminal["usage"] == Usage().as_dict()
 
 
 @pytest.mark.asyncio
@@ -1618,7 +1813,11 @@ async def test_agent_loop_records_worker_error_after_cancel_without_secrets(
 
     assert tools.finished.is_set()
     assert writer._handle.closed
-    record = json.loads(writer.path.read_text(encoding="utf-8"))
+    records = [
+        json.loads(line)
+        for line in writer.path.read_text(encoding="utf-8").splitlines()
+    ]
+    record, terminal = records
     assert record["status"] == "error_after_cancel"
     assert record["result_summary"] == "stat_path failed: RuntimeError"
     assert record["error_code"] == "TOOL_EXECUTION_FAILED"
@@ -1626,6 +1825,9 @@ async def test_agent_loop_records_worker_error_after_cancel_without_secrets(
     serialized = json.dumps(record)
     assert "worker-secret" not in serialized
     assert "C:/private" not in serialized
+    assert terminal["status"] == "cancelled"
+    assert terminal["model_calls"] == 1
+    assert terminal["usage"] == Usage().as_dict()
 
 
 def test_system_policy_is_generic_and_marks_injection_boundary() -> None:

@@ -300,6 +300,48 @@ def test_trace_writer_replaces_write_content_with_size_and_sha256(
     }
 
 
+@pytest.mark.parametrize(
+    "status",
+    ["completed", "failed", "cancelled", "interrupted"],
+)
+def test_trace_writer_accepts_each_terminal_run_status_once(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    writer = TraceStore(tmp_path / "traces").create(f"run-{status}")
+
+    try:
+        with pytest.raises(ValueError, match="terminal run status"):
+            writer.append_run_status(
+                status="running",
+                model_calls=0,
+                usage={},
+            )
+        writer.append_run_status(
+            status=status,
+            model_calls=2,
+            usage={
+                "prompt_tokens": 3,
+                "completion_tokens": 4,
+                "total_tokens": 7,
+            },
+        )
+        with pytest.raises(ValueError, match="terminal run status"):
+            writer.append_run_status(
+                status=status,
+                model_calls=2,
+                usage={},
+            )
+    finally:
+        writer.close()
+
+    records = [
+        json.loads(line)
+        for line in writer.path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["status"] for record in records] == [status]
+
+
 def test_sanitize_args_does_not_mutate_original_arguments() -> None:
     original = {
         "path": "note.txt",

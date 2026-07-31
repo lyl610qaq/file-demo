@@ -6,6 +6,7 @@ import inspect
 import json
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias
 
 from workspace_agent.model import validate_model_reply
@@ -56,6 +57,12 @@ class ModelClient(Protocol):
     ) -> ModelReply: ...
 
 
+@dataclass
+class _RunProgress:
+    model_calls: int = 0
+    usage: Usage = field(default_factory=Usage)
+
+
 async def _emit(sink: EventSink, event: Event) -> None:
     result = sink(event)
     if inspect.isawaitable(result):
@@ -98,15 +105,38 @@ class AgentRunner:
 
         run_id = str(uuid.uuid4())
         writer = self._traces.create(run_id)
+        progress = _RunProgress()
+        terminal_status = "interrupted"
         try:
-            return await self._run_with_writer(
-                run_id,
-                task,
-                sink,
-                writer,
-            )
+            try:
+                result = await self._run_with_writer(
+                    run_id,
+                    task,
+                    sink,
+                    writer,
+                    progress,
+                )
+            except asyncio.CancelledError:
+                terminal_status = "cancelled"
+                raise
+            except BaseException:
+                terminal_status = "interrupted"
+                raise
+            else:
+                terminal_status = result.status
+                return result
         finally:
-            writer.close()
+            try:
+                writer.append_run_status(
+                    status=terminal_status,
+                    model_calls=progress.model_calls,
+                    usage=progress.usage.as_dict(),
+                )
+            except BaseException:
+                if terminal_status not in {"cancelled", "interrupted"}:
+                    raise
+            finally:
+                writer.close()
 
     async def _run_with_writer(
         self,
@@ -114,13 +144,14 @@ class AgentRunner:
         task: str,
         sink: EventSink,
         writer: TraceWriter,
+        progress: _RunProgress,
     ) -> RunResult:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_POLICY},
             {"role": "user", "content": task},
         ]
-        usage = Usage()
-        model_calls = 0
+        usage = progress.usage
+        model_calls = progress.model_calls
         empty_replies = 0
         step = 0
         previous_signature: str | None = None
@@ -139,10 +170,10 @@ class AgentRunner:
                     model_calls,
                     usage,
                     sink,
-                    writer,
                 )
 
             model_calls += 1
+            progress.model_calls = model_calls
             await _emit(
                 sink,
                 {
@@ -162,10 +193,10 @@ class AgentRunner:
                     model_calls,
                     usage,
                     sink,
-                    writer,
                 )
 
             usage = usage.plus(reply.usage)
+            progress.usage = usage
             await _emit(
                 sink,
                 {
@@ -187,7 +218,6 @@ class AgentRunner:
                         model_calls,
                         usage,
                         sink,
-                        writer,
                     )
                 if (
                     total_tool_calls + response_tool_calls
@@ -199,7 +229,6 @@ class AgentRunner:
                         model_calls,
                         usage,
                         sink,
-                        writer,
                     )
                 total_tool_calls += response_tool_calls
 
@@ -227,7 +256,6 @@ class AgentRunner:
                             model_calls,
                             usage,
                             sink,
-                            writer,
                         )
 
                     step += 1
@@ -304,7 +332,6 @@ class AgentRunner:
                             model_calls,
                             usage,
                             sink,
-                            writer,
                         )
                     aggregate_result_bytes += len(
                         model_payload.encode("utf-8")
@@ -319,7 +346,6 @@ class AgentRunner:
                             model_calls,
                             usage,
                             sink,
-                            writer,
                         )
                     messages.append(
                         {
@@ -347,11 +373,6 @@ class AgentRunner:
                     model_calls=model_calls,
                     usage=usage,
                 )
-                writer.append_run_status(
-                    status="completed",
-                    model_calls=model_calls,
-                    usage=usage.as_dict(),
-                )
                 await _emit(
                     sink,
                     {
@@ -373,7 +394,6 @@ class AgentRunner:
                     model_calls,
                     usage,
                     sink,
-                    writer,
                 )
             messages.append(
                 {"role": "user", "content": _EMPTY_REPLY_CORRECTION}
@@ -412,7 +432,10 @@ class AgentRunner:
                     summary=f"{name} failed: {type(error).__name__}",
                     error_code="TOOL_EXECUTION_FAILED",
                 )
-            on_cancelled(settled_result)
+            try:
+                on_cancelled(settled_result)
+            except Exception:
+                pass
             raise
         except Exception as error:
             return ToolResult(
@@ -429,7 +452,6 @@ class AgentRunner:
         model_calls: int,
         usage: Usage,
         sink: EventSink,
-        writer: TraceWriter,
     ) -> RunResult:
         result = RunResult(
             run_id=run_id,
@@ -437,11 +459,6 @@ class AgentRunner:
             message=message,
             model_calls=model_calls,
             usage=usage,
-        )
-        writer.append_run_status(
-            status="failed",
-            model_calls=model_calls,
-            usage=usage.as_dict(),
         )
         await _emit(
             sink,

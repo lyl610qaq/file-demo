@@ -930,7 +930,11 @@ def test_websocket_timeout_waits_for_tool_before_releasing_workspace(
 
     trace_files = list((tmp_path / "traces").glob("*.jsonl"))
     assert len(trace_files) == 1
-    record = json.loads(trace_files[0].read_text(encoding="utf-8"))
+    records = [
+        json.loads(line)
+        for line in trace_files[0].read_text(encoding="utf-8").splitlines()
+    ]
+    record, terminal_record = records
     assert terminal == {"type": "run_failed", "message": "Run timed out"}
     assert written_content == content
     assert record["status"] == "success_after_cancel"
@@ -945,6 +949,8 @@ def test_websocket_timeout_waits_for_tool_before_releasing_workspace(
             content.encode("utf-8")
         ).hexdigest(),
     }
+    assert terminal_record["status"] == "cancelled"
+    assert terminal_record["model_calls"] == 1
     assert content not in trace_files[0].read_text(encoding="utf-8")
     assert reset.status_code == 200
 
@@ -2028,8 +2034,10 @@ def test_websocket_disconnect_cancels_runner_and_waits_for_tool(
         json.loads(line)
         for line in trace_files[0].read_text(encoding="utf-8").splitlines()
     ]
-    assert records[-1]["status"] == "success_after_cancel"
-    assert records[-1]["result_summary"] == "settled"
+    assert records[0]["status"] == "success_after_cancel"
+    assert records[0]["result_summary"] == "settled"
+    assert records[1]["status"] == "cancelled"
+    assert records[1]["model_calls"] == 1
 
 
 def test_app_closes_only_the_model_it_constructed(
