@@ -1885,6 +1885,10 @@ def test_frontend_assets_are_served_and_use_safe_browser_primitives(
     script = script_response.text
     assert "textContent" in script
     assert "innerHTML" not in script
+    assert "response.text()" not in script
+    assert "body.getReader()" in script
+    assert "response.arrayBuffer()" in script
+    assert "TextDecoder" in script
     assert "URLSearchParams" in script
     assert 'location.protocol === "https:" ? "wss:" : "ws:"' in script
     assert "new WebSocket" in script

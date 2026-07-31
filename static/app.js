@@ -5,11 +5,11 @@
   const TREE_INITIAL_PAGES = 20;
   const TREE_MAX_PAGES = 25;
   const TREE_MAX_ENTRIES = 5000;
-  const TREE_MAX_JSON_CHARS = 2 * 1024 * 1024;
+  const TREE_MAX_JSON_BYTES = 2 * 1024 * 1024;
   const FILE_PAGE_BYTES = 65536;
   const FILE_MAX_PAGES = 128;
-  const FILE_MAX_PREVIEW_CHARS = 1024 * 1024;
-  const MAX_JSON_RESPONSE_CHARS = 2 * 1024 * 1024;
+  const FILE_MAX_PREVIEW_BYTES = 1024 * 1024;
+  const MAX_JSON_RESPONSE_BYTES = 2 * 1024 * 1024;
   const MAX_SOCKET_EVENT_CHARS = 256 * 1024;
   const MAX_EVENT_STRING_CHARS = 64 * 1024;
   const MAX_TOOL_EVENT_CHARS = 64 * 1024;
@@ -20,6 +20,7 @@
   const RUN_WATCHDOG_MAX_MS = 3605000;
   const API_TREE = "/api/tree";
   const API_FILE = "/api/file";
+  const UTF8_ENCODER = new TextEncoder();
   const EVENT_TYPES = new Set([
     "run_started",
     "model_call_started",
@@ -52,7 +53,7 @@
     treeCursor: null,
     treeSeenCursors: new Set(),
     treePages: 0,
-    treeJsonChars: 0,
+    treeJsonBytes: 0,
     treeLoading: false,
     treeLimitReached: false,
     collapsedPaths: new Set(),
@@ -200,6 +201,108 @@
     return "请求未完成，请重试";
   }
 
+  function responseTooLargeError() {
+    return userError("RESPONSE_TOO_LARGE", "响应内容过大");
+  }
+
+  function invalidResponseError() {
+    return userError(
+      "INVALID_RESPONSE",
+      "服务返回了无法识别的数据",
+    );
+  }
+
+  function trustedContentLength(response) {
+    const raw = response.headers?.get?.("content-length");
+    if (typeof raw !== "string" || !/^\d+$/.test(raw.trim())) {
+      return null;
+    }
+    const parsed = Number(raw.trim());
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+  }
+
+  function decodeUtf8(bytes) {
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw invalidResponseError();
+    }
+  }
+
+  async function cancelReader(reader) {
+    try {
+      await reader.cancel();
+    } catch {
+      // Preserve the stable size error even if stream cleanup fails.
+    }
+  }
+
+  async function readResponseTextLimited(response, maxBytes) {
+    if (!isNonnegativeInteger(maxBytes)) {
+      throw invalidResponseError();
+    }
+
+    const contentLength = trustedContentLength(response);
+    if (contentLength !== null && contentLength > maxBytes) {
+      throw responseTooLargeError();
+    }
+
+    if (response.body && typeof response.body.getReader === "function") {
+      const reader = response.body.getReader();
+      const chunks = [];
+      let byteLength = 0;
+      while (true) {
+        const result = await reader.read();
+        if (
+          result === null ||
+          typeof result !== "object" ||
+          Array.isArray(result) ||
+          typeof result.done !== "boolean"
+        ) {
+          await cancelReader(reader);
+          throw invalidResponseError();
+        }
+        if (result.done) {
+          break;
+        }
+        if (!(result.value instanceof Uint8Array)) {
+          await cancelReader(reader);
+          throw invalidResponseError();
+        }
+        byteLength += result.value.byteLength;
+        if (!Number.isSafeInteger(byteLength) || byteLength > maxBytes) {
+          await cancelReader(reader);
+          throw responseTooLargeError();
+        }
+        chunks.push(result.value);
+      }
+
+      const bytes = new Uint8Array(byteLength);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return { text: decodeUtf8(bytes), byteLength };
+    }
+
+    if (typeof response.arrayBuffer !== "function") {
+      throw invalidResponseError();
+    }
+    const buffer = await response.arrayBuffer();
+    if (!(buffer instanceof ArrayBuffer)) {
+      throw invalidResponseError();
+    }
+    const bytes = new Uint8Array(buffer);
+    if (bytes.byteLength > maxBytes) {
+      throw responseTooLargeError();
+    }
+    return {
+      text: decodeUtf8(bytes),
+      byteLength: bytes.byteLength,
+    };
+  }
+
   async function fetchJson(path, options = {}, context = "request") {
     const controller = new AbortController();
     const externalSignal = options.signal;
@@ -227,10 +330,11 @@
         },
         signal: controller.signal,
       });
-      const raw = await response.text();
-      if (raw.length > MAX_JSON_RESPONSE_CHARS) {
-        throw userError("RESPONSE_TOO_LARGE", "响应内容过大");
-      }
+      const limited = await readResponseTextLimited(
+        response,
+        MAX_JSON_RESPONSE_BYTES,
+      );
+      const raw = limited.text;
 
       let payload = null;
       try {
@@ -255,12 +359,9 @@
         throw error;
       }
       if (!isPlainObject(payload)) {
-        throw userError(
-          "INVALID_RESPONSE",
-          "服务返回了无法识别的数据",
-        );
+        throw invalidResponseError();
       }
-      return { data: payload, textLength: raw.length };
+      return { data: payload, byteLength: limited.byteLength };
     } catch (error) {
       if (error && error.name === "AbortError") {
         if (!timedOut && externalSignal?.aborted) {
@@ -347,7 +448,7 @@
     state.treeCursor = null;
     state.treeSeenCursors = new Set();
     state.treePages = 0;
-    state.treeJsonChars = 0;
+    state.treeJsonBytes = 0;
     state.treeLimitReached = false;
   }
 
@@ -394,15 +495,15 @@
           "tree",
         );
         if (
-          state.treeJsonChars + response.textLength >
-          TREE_MAX_JSON_CHARS
+          state.treeJsonBytes + response.byteLength >
+          TREE_MAX_JSON_BYTES
         ) {
           state.treeLimitReached = true;
           state.treeCursor = null;
           limitMessage = "文件列表响应过大，仅显示已加载内容";
           break;
         }
-        state.treeJsonChars += response.textLength;
+        state.treeJsonBytes += response.byteLength;
 
         const page = validateTreePayload(response.data);
         if (!page) {
@@ -680,6 +781,10 @@
       !(
         payload.next_cursor === null ||
         typeof payload.next_cursor === "string"
+      ) ||
+      !(
+        payload.bytes_read === undefined ||
+        isNonnegativeInteger(payload.bytes_read)
       )
     ) {
       return null;
@@ -691,8 +796,53 @@
       nextOffset: payload.next_offset,
       hasMore: payload.has_more,
       nextCursor: payload.next_cursor,
+      bytesRead:
+        payload.bytes_read === undefined ? null : payload.bytes_read,
       encoding: safeString(payload.encoding, "文本"),
     };
+  }
+
+  function measureFilePageBytes(page) {
+    const offsetBytes = page.nextOffset - page.offset;
+    const utf8Bytes = UTF8_ENCODER.encode(page.content).byteLength;
+    return {
+      utf8Bytes,
+      budgetBytes: Math.max(
+        offsetBytes,
+        page.bytesRead ?? 0,
+        utf8Bytes,
+      ),
+    };
+  }
+
+  function truncateUtf8(text, maxBytes) {
+    const bytes = UTF8_ENCODER.encode(text);
+    if (bytes.byteLength <= maxBytes) {
+      return { text, byteLength: bytes.byteLength };
+    }
+    let end = Math.min(maxBytes, bytes.byteLength);
+    while (end > 0) {
+      try {
+        return {
+          text: new TextDecoder("utf-8", { fatal: true }).decode(
+            bytes.subarray(0, end),
+          ),
+          byteLength: end,
+        };
+      } catch {
+        end -= 1;
+      }
+    }
+    return { text: "", byteLength: 0 };
+  }
+
+  function formatBytes(bytes) {
+    if (bytes >= 1024 * 1024) {
+      const megabytes = bytes / (1024 * 1024);
+      const digits = Number.isInteger(megabytes) ? 0 : 2;
+      return `${megabytes.toFixed(digits)} MB`;
+    }
+    return `${bytes} 字节`;
   }
 
   function fileRequestIsCurrent(token, path, pagePath = path) {
@@ -722,6 +872,7 @@
     let cursor = null;
     let expectedOffset = 0;
     let content = "";
+    let contentBytes = 0;
     let encoding = "文本";
     let truncated = false;
     const seenCursors = new Set();
@@ -769,13 +920,31 @@
         }
 
         encoding = page.encoding;
-        const remaining = FILE_MAX_PREVIEW_CHARS - content.length;
-        if (page.content.length > remaining) {
-          content += page.content.slice(0, remaining);
+        const measured = measureFilePageBytes(page);
+        const remaining = FILE_MAX_PREVIEW_BYTES - contentBytes;
+        if (measured.budgetBytes > remaining) {
+          const utf8Limit = measured.budgetBytes === 0
+            ? 0
+            : Math.floor(
+                (remaining * measured.utf8Bytes) /
+                measured.budgetBytes,
+              );
+          const clipped = truncateUtf8(page.content, utf8Limit);
+          content += clipped.text;
+          contentBytes += measured.utf8Bytes === 0
+            ? 0
+            : Math.min(
+                remaining,
+                Math.ceil(
+                  (clipped.byteLength * measured.budgetBytes) /
+                  measured.utf8Bytes,
+                ),
+              );
           truncated = true;
           break;
         }
         content += page.content;
+        contentBytes += measured.budgetBytes;
         expectedOffset = page.nextOffset;
 
         if (!page.hasMore) {
@@ -784,7 +953,7 @@
         seenCursors.add(page.nextCursor);
         cursor = page.nextCursor;
         if (
-          content.length >= FILE_MAX_PREVIEW_CHARS ||
+          contentBytes >= FILE_MAX_PREVIEW_BYTES ||
           pageNumber + 1 >= FILE_MAX_PAGES
         ) {
           truncated = true;
@@ -803,8 +972,8 @@
         setText(
           "viewer-meta",
           truncated
-            ? `${encoding} · 内容过大，仅显示前 ${content.length} 个字符`
-            : `${encoding} · ${content.length} 个字符`,
+            ? `${encoding} · 内容过大，仅显示前 ${formatBytes(contentBytes)}`
+            : `${encoding} · ${formatBytes(contentBytes)}`,
         );
       }
     } catch (error) {

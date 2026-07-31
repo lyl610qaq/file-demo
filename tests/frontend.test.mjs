@@ -14,6 +14,10 @@ const flush = async () => {
   }
 };
 
+const UTF8_ENCODER = new TextEncoder();
+const JSON_RESPONSE_BYTE_LIMIT = 2 * 1024 * 1024;
+const FILE_PREVIEW_BYTE_LIMIT = 1024 * 1024;
+
 class FakeClassList {
   constructor(owner) {
     this.owner = owner;
@@ -344,21 +348,77 @@ class FakeClock {
   }
 }
 
-const jsonResponse = (value, options = {}) => {
+const responseBytes = (value) =>
+  value instanceof Uint8Array ? value : UTF8_ENCODER.encode(String(value));
+
+const byteResponse = (raw, options = {}) => {
   const status = options.status ?? 200;
-  const raw = options.raw ?? JSON.stringify(value);
+  const bytes = responseBytes(raw);
+  const chunks = (options.chunks ?? [bytes]).map(responseBytes);
+  const stats = options.stats ?? {};
+  stats.reads ??= 0;
+  stats.cancels ??= 0;
+  stats.textCalls ??= 0;
+  stats.arrayBufferCalls ??= 0;
+  stats.getReaderCalls ??= 0;
+  let chunkIndex = 0;
+  let cancelled = false;
+  const contentLength = options.contentLength === undefined
+    ? String(bytes.byteLength)
+    : options.contentLength;
+
   return {
     ok: status >= 200 && status < 300,
     status,
     statusText: "",
+    headers: {
+      get(name) {
+        return String(name).toLowerCase() === "content-length"
+          ? contentLength
+          : null;
+      },
+    },
+    body: options.body === false
+      ? null
+      : {
+          getReader() {
+            stats.getReaderCalls += 1;
+            return {
+              async read() {
+                stats.reads += 1;
+                if (cancelled || chunkIndex >= chunks.length) {
+                  return { done: true, value: undefined };
+                }
+                const value = chunks[chunkIndex];
+                chunkIndex += 1;
+                return { done: false, value };
+              },
+              async cancel() {
+                stats.cancels += 1;
+                cancelled = true;
+              },
+            };
+          },
+        },
     async json() {
       return JSON.parse(raw);
     },
     async text() {
+      stats.textCalls += 1;
       return raw;
+    },
+    async arrayBuffer() {
+      stats.arrayBufferCalls += 1;
+      return bytes.buffer.slice(
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength,
+      );
     },
   };
 };
+
+const jsonResponse = (value, options = {}) =>
+  byteResponse(options.raw ?? JSON.stringify(value), options);
 
 const abortError = () => {
   const error = new Error("aborted");
@@ -497,6 +557,10 @@ async function createHarness(fetchRoute, options = {}) {
   });
   const context = vm.createContext({
     AbortController,
+    ArrayBuffer,
+    TextDecoder,
+    TextEncoder,
+    Uint8Array,
     URLSearchParams,
     WebSocket: SocketConstructor,
     console,
@@ -841,14 +905,88 @@ test("file continuation sends the cursor's byte offset", async () => {
   assert.equal(continuation.searchParams.get("offset"), "3");
 });
 
-test("a single JSON response is bounded before parsing", async () => {
-  const oversized = "x".repeat(2 * 1024 * 1024 + 1);
+test("stream reader accepts an exact ASCII byte boundary", async () => {
+  const prefix =
+    '{"entries":[],"has_more":false,"next_cursor":null,"pad":"';
+  const suffix = '"}';
+  const fixedBytes = UTF8_ENCODER.encode(prefix + suffix).byteLength;
+  const raw = prefix + "x".repeat(JSON_RESPONSE_BYTE_LIMIT - fixedBytes) + suffix;
+  const bytes = UTF8_ENCODER.encode(raw);
+  const stats = {};
   const harness = await createHarness(async (url) => {
     if (url === "/api/meta") {
       return configuredMeta();
     }
     if (url.startsWith("/api/tree")) {
-      return jsonResponse({}, { raw: oversized });
+      return byteResponse(raw, {
+        chunks: [bytes.subarray(0, 700_000), bytes.subarray(700_000)],
+        stats,
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  assert.equal(bytes.byteLength, JSON_RESPONSE_BYTE_LIMIT);
+  assert.equal(
+    harness.document.getElementById("tree-status").textContent,
+    "工作区为空",
+  );
+  assert.equal(stats.getReaderCalls, 1);
+  assert.equal(stats.textCalls, 0);
+  assert.equal(stats.cancels, 0);
+});
+
+test("stream reader decodes Chinese and emoji split across chunks", async () => {
+  const raw = JSON.stringify({
+    entries: [],
+    has_more: false,
+    next_cursor: null,
+    note: "中文🙂",
+  });
+  const emojiIndex = raw.indexOf("🙂");
+  const emojiByteStart = UTF8_ENCODER.encode(raw.slice(0, emojiIndex)).byteLength;
+  const bytes = UTF8_ENCODER.encode(raw);
+  const stats = {};
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return configuredMeta();
+    }
+    if (url.startsWith("/api/tree")) {
+      return byteResponse(raw, {
+        chunks: [
+          bytes.subarray(0, emojiByteStart + 1),
+          bytes.subarray(emojiByteStart + 1, emojiByteStart + 3),
+          bytes.subarray(emojiByteStart + 3),
+        ],
+        stats,
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  assert.equal(
+    harness.document.getElementById("tree-status").textContent,
+    "工作区为空",
+  );
+  assert.equal(stats.getReaderCalls, 1);
+  assert.equal(stats.textCalls, 0);
+  assert.equal(stats.cancels, 0);
+});
+
+test("single oversized stream chunk is cancelled without UI injection", async () => {
+  const marker = "UNTRUSTED_UI_MARKER";
+  const raw = "x".repeat(JSON_RESPONSE_BYTE_LIMIT + 1) + marker;
+  const stats = {};
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return configuredMeta();
+    }
+    if (url.startsWith("/api/tree")) {
+      return byteResponse(raw, {
+        contentLength: null,
+        chunks: [UTF8_ENCODER.encode(raw)],
+        stats,
+      });
     }
     throw new Error(`unexpected fetch: ${url}`);
   });
@@ -856,6 +994,117 @@ test("a single JSON response is bounded before parsing", async () => {
   assert.match(
     harness.document.getElementById("tree-status").textContent,
     /响应内容过大/,
+  );
+  assert.equal(stats.reads, 1);
+  assert.equal(stats.cancels, 1);
+  assert.equal(stats.textCalls, 0);
+  assert.equal(harness.document.body.textContent.includes(marker), false);
+});
+
+test("multi-chunk overflow cancels before reading later chunks", async () => {
+  const marker = "LATE_UNTRUSTED_MARKER";
+  const first = UTF8_ENCODER.encode("x".repeat(JSON_RESPONSE_BYTE_LIMIT));
+  const second = UTF8_ENCODER.encode("y");
+  const third = UTF8_ENCODER.encode(marker);
+  const stats = {};
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return configuredMeta();
+    }
+    if (url.startsWith("/api/tree")) {
+      return byteResponse(
+        "x".repeat(JSON_RESPONSE_BYTE_LIMIT) + "y" + marker,
+        {
+          contentLength: null,
+          chunks: [first, second, third],
+          stats,
+        },
+      );
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  assert.match(
+    harness.document.getElementById("tree-status").textContent,
+    /响应内容过大/,
+  );
+  assert.equal(stats.reads, 2);
+  assert.equal(stats.cancels, 1);
+  assert.equal(stats.textCalls, 0);
+  assert.equal(harness.document.body.textContent.includes(marker), false);
+});
+
+test("oversized Content-Length is rejected before body reading", async () => {
+  const raw = JSON.stringify(defaultTree);
+  const stats = {};
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return configuredMeta();
+    }
+    if (url.startsWith("/api/tree")) {
+      return byteResponse(raw, {
+        contentLength: String(JSON_RESPONSE_BYTE_LIMIT + 1),
+        stats,
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  assert.match(
+    harness.document.getElementById("tree-status").textContent,
+    /响应内容过大/,
+  );
+  assert.equal(stats.getReaderCalls, 0);
+  assert.equal(stats.reads, 0);
+  assert.equal(stats.textCalls, 0);
+  assert.equal(stats.arrayBufferCalls, 0);
+});
+
+test("response without a body uses bounded arrayBuffer fallback", async () => {
+  const stats = {};
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return configuredMeta();
+    }
+    if (url.startsWith("/api/tree")) {
+      return jsonResponse(defaultTree, { body: false, stats });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  assert.equal(
+    harness.document.getElementById("tree-status").textContent,
+    "工作区为空",
+  );
+  assert.equal(stats.arrayBufferCalls, 1);
+  assert.equal(stats.textCalls, 0);
+});
+
+test("tree aggregate budget counts UTF-8 wire bytes", async () => {
+  let page = 0;
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return configuredMeta();
+    }
+    if (url.startsWith("/api/tree")) {
+      page += 1;
+      return jsonResponse({
+        entries: [{ path: `page-${page}.md`, type: "file", size: 1 }],
+        has_more: page === 1,
+        next_cursor: page === 1 ? "page-2" : null,
+        pad: "中".repeat(400_000),
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  assert.equal(
+    harness.document.getElementById("tree-summary").textContent,
+    "1 项",
+  );
+  assert.match(
+    harness.document.getElementById("tree-status").textContent,
+    /响应过大.*仅显示已加载内容/,
   );
 });
 
@@ -935,15 +1184,16 @@ test("repeated load-more clicks share one in-flight request", async () => {
   await Promise.all([first, second]);
 });
 
-test("file preview enforces the 1 MiB content cap", async () => {
-  const oversized = "x".repeat(1024 * 1024 + 100);
+test("file preview truncates Chinese content by UTF-8 bytes", async () => {
+  const oversized = "中".repeat(400_000);
+  const oversizedBytes = UTF8_ENCODER.encode(oversized).byteLength;
   const route = async (url) => {
     if (url === "/api/meta") {
       return configuredMeta();
     }
     if (url.startsWith("/api/tree")) {
       return jsonResponse({
-        entries: [{ path: "large.md", type: "file", size: oversized.length }],
+        entries: [{ path: "large.md", type: "file", size: oversizedBytes }],
         has_more: false,
         next_cursor: null,
       });
@@ -953,10 +1203,10 @@ test("file preview enforces the 1 MiB content cap", async () => {
         path: "large.md",
         content: oversized,
         offset: 0,
-        next_offset: oversized.length,
-        has_more: true,
+        next_offset: oversizedBytes,
+        has_more: false,
         encoding: "utf-8",
-        next_cursor: "next",
+        next_cursor: null,
       });
     }
     throw new Error(`unexpected fetch: ${url}`);
@@ -964,14 +1214,61 @@ test("file preview enforces the 1 MiB content cap", async () => {
   const harness = await createHarness(route);
   await fileButton(harness, "large.md").click();
 
-  assert.ok(
-    harness.document.getElementById("file-content").textContent.length <=
-      1024 * 1024,
-  );
+  const visible = harness.document.getElementById("file-content").textContent;
+  assert.ok(visible.length < oversized.length);
+  assert.ok(UTF8_ENCODER.encode(visible).byteLength <= FILE_PREVIEW_BYTE_LIMIT);
   assert.match(
     harness.document.getElementById("viewer-meta").textContent,
-    /仅显示前/,
+    /仅显示前.*(字节|MB)/,
   );
+  assert.doesNotMatch(
+    harness.document.getElementById("viewer-meta").textContent,
+    /字符/,
+  );
+});
+
+test("one MiB of Chinese characters is rejected as a three MiB response", async () => {
+  const content = "中".repeat(1024 * 1024);
+  const stats = {};
+  const route = async (url) => {
+    if (url === "/api/meta") {
+      return configuredMeta();
+    }
+    if (url.startsWith("/api/tree")) {
+      return jsonResponse({
+        entries: [{ path: "three-mib.md", type: "file", size: 3 * 1024 * 1024 }],
+        has_more: false,
+        next_cursor: null,
+      });
+    }
+    if (url.includes("/api/file")) {
+      const raw = JSON.stringify({
+        path: "three-mib.md",
+        content,
+        offset: 0,
+        next_offset: 3 * 1024 * 1024,
+        has_more: false,
+        encoding: "utf-8",
+        next_cursor: null,
+      });
+      return byteResponse(raw, {
+        contentLength: null,
+        chunks: [UTF8_ENCODER.encode(raw)],
+        stats,
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+  const harness = await createHarness(route);
+
+  await fileButton(harness, "three-mib.md").click();
+
+  const displayed = harness.document.getElementById("file-content").textContent;
+  assert.ok(displayed.length < 100);
+  assert.equal(displayed, "响应内容过大");
+  assert.equal(stats.reads, 1);
+  assert.equal(stats.cancels, 1);
+  assert.equal(stats.textCalls, 0);
 });
 
 async function runningHarness(metaSeconds = 1) {
