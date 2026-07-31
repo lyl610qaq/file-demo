@@ -1887,7 +1887,7 @@ def test_frontend_assets_are_served_and_use_safe_browser_primitives(
     assert "innerHTML" not in script
     assert "response.text()" not in script
     assert "body.getReader()" in script
-    assert "response.arrayBuffer()" in script
+    assert "response.arrayBuffer()" not in script
     assert "TextDecoder" in script
     assert "URLSearchParams" in script
     assert 'location.protocol === "https:" ? "wss:" : "ws:"' in script

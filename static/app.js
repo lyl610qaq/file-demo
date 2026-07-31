@@ -212,6 +212,10 @@
     );
   }
 
+  function streamUnavailableError() {
+    return userError("STREAM_UNAVAILABLE", "响应流不可用");
+  }
+
   function trustedContentLength(response) {
     const raw = response.headers?.get?.("content-length");
     if (typeof raw !== "string" || !/^\d+$/.test(raw.trim())) {
@@ -237,70 +241,75 @@
     }
   }
 
-  async function readResponseTextLimited(response, maxBytes) {
+  async function cancelResponseBody(response) {
+    const body = response.body;
+    if (!body || body.locked || typeof body.cancel !== "function") {
+      return;
+    }
+    try {
+      await body.cancel();
+    } catch {
+      // Preserve the stable size error even if response cleanup fails.
+    }
+  }
+
+  async function readResponseTextLimited(
+    response,
+    maxBytes,
+    abortController = null,
+  ) {
     if (!isNonnegativeInteger(maxBytes)) {
       throw invalidResponseError();
     }
 
     const contentLength = trustedContentLength(response);
     if (contentLength !== null && contentLength > maxBytes) {
+      const cancellation = cancelResponseBody(response);
+      abortController?.abort();
+      await cancellation;
       throw responseTooLargeError();
     }
 
-    if (response.body && typeof response.body.getReader === "function") {
-      const reader = response.body.getReader();
-      const chunks = [];
-      let byteLength = 0;
-      while (true) {
-        const result = await reader.read();
-        if (
-          result === null ||
-          typeof result !== "object" ||
-          Array.isArray(result) ||
-          typeof result.done !== "boolean"
-        ) {
-          await cancelReader(reader);
-          throw invalidResponseError();
-        }
-        if (result.done) {
-          break;
-        }
-        if (!(result.value instanceof Uint8Array)) {
-          await cancelReader(reader);
-          throw invalidResponseError();
-        }
-        byteLength += result.value.byteLength;
-        if (!Number.isSafeInteger(byteLength) || byteLength > maxBytes) {
-          await cancelReader(reader);
-          throw responseTooLargeError();
-        }
-        chunks.push(result.value);
-      }
-
-      const bytes = new Uint8Array(byteLength);
-      let offset = 0;
-      for (const chunk of chunks) {
-        bytes.set(chunk, offset);
-        offset += chunk.byteLength;
-      }
-      return { text: decodeUtf8(bytes), byteLength };
+    if (!response.body || typeof response.body.getReader !== "function") {
+      throw streamUnavailableError();
     }
 
-    if (typeof response.arrayBuffer !== "function") {
-      throw invalidResponseError();
+    const reader = response.body.getReader();
+    const chunks = [];
+    let byteLength = 0;
+    while (true) {
+      const result = await reader.read();
+      if (
+        result === null ||
+        typeof result !== "object" ||
+        Array.isArray(result) ||
+        typeof result.done !== "boolean"
+      ) {
+        await cancelReader(reader);
+        throw invalidResponseError();
+      }
+      if (result.done) {
+        break;
+      }
+      if (!(result.value instanceof Uint8Array)) {
+        await cancelReader(reader);
+        throw invalidResponseError();
+      }
+      byteLength += result.value.byteLength;
+      if (!Number.isSafeInteger(byteLength) || byteLength > maxBytes) {
+        await cancelReader(reader);
+        throw responseTooLargeError();
+      }
+      chunks.push(result.value);
     }
-    const buffer = await response.arrayBuffer();
-    if (!(buffer instanceof ArrayBuffer)) {
-      throw invalidResponseError();
+
+    const bytes = new Uint8Array(byteLength);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
     }
-    const bytes = new Uint8Array(buffer);
-    if (bytes.byteLength > maxBytes) {
-      throw responseTooLargeError();
-    }
-    return {
-      text: decodeUtf8(bytes),
-      byteLength: bytes.byteLength,
-    };
+    return { text: decodeUtf8(bytes), byteLength };
   }
 
   async function fetchJson(path, options = {}, context = "request") {
@@ -333,6 +342,7 @@
       const limited = await readResponseTextLimited(
         response,
         MAX_JSON_RESPONSE_BYTES,
+        controller,
       );
       const raw = limited.text;
 

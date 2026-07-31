@@ -361,6 +361,7 @@ const byteResponse = (raw, options = {}) => {
   stats.textCalls ??= 0;
   stats.arrayBufferCalls ??= 0;
   stats.getReaderCalls ??= 0;
+  stats.bodyCancels ??= 0;
   let chunkIndex = 0;
   let cancelled = false;
   const contentLength = options.contentLength === undefined
@@ -381,6 +382,14 @@ const byteResponse = (raw, options = {}) => {
     body: options.body === false
       ? null
       : {
+          locked: options.bodyLocked === true,
+          async cancel() {
+            stats.bodyCancels += 1;
+            cancelled = true;
+            if (options.bodyCancelError) {
+              throw new Error("body cancel failed");
+            }
+          },
           getReader() {
             stats.getReaderCalls += 1;
             return {
@@ -1056,27 +1065,121 @@ test("oversized Content-Length is rejected before body reading", async () => {
   );
   assert.equal(stats.getReaderCalls, 0);
   assert.equal(stats.reads, 0);
+  assert.equal(stats.bodyCancels, 1);
   assert.equal(stats.textCalls, 0);
   assert.equal(stats.arrayBufferCalls, 0);
+  const treeRequest = harness.fetchCalls.find(({ url }) =>
+    url.startsWith("/api/tree"),
+  );
+  assert.equal(treeRequest.request.signal.aborted, true);
 });
 
-test("response without a body uses bounded arrayBuffer fallback", async () => {
+test("Content-Length rejection keeps the size error when body cancel fails", async () => {
   const stats = {};
   const harness = await createHarness(async (url) => {
     if (url === "/api/meta") {
       return configuredMeta();
     }
     if (url.startsWith("/api/tree")) {
-      return jsonResponse(defaultTree, { body: false, stats });
+      return jsonResponse(defaultTree, {
+        bodyCancelError: true,
+        contentLength: String(JSON_RESPONSE_BYTE_LIMIT + 1),
+        stats,
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  assert.match(
+    harness.document.getElementById("tree-status").textContent,
+    /响应内容过大/,
+  );
+  assert.equal(stats.bodyCancels, 1);
+  assert.equal(stats.getReaderCalls, 0);
+  assert.equal(stats.reads, 0);
+  const treeRequest = harness.fetchCalls.find(({ url }) =>
+    url.startsWith("/api/tree"),
+  );
+  assert.equal(treeRequest.request.signal.aborted, true);
+});
+
+test("missing stream and Content-Length fails closed without arrayBuffer", async () => {
+  const marker = "MISSING_STREAM_MARKER";
+  const stats = {};
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return configuredMeta();
+    }
+    if (url.startsWith("/api/tree")) {
+      return jsonResponse(
+        { ...defaultTree, note: marker },
+        { body: false, contentLength: null, stats },
+      );
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  assert.match(
+    harness.document.getElementById("tree-status").textContent,
+    /响应流不可用/,
+  );
+  assert.equal(stats.arrayBufferCalls, 0);
+  assert.equal(stats.textCalls, 0);
+  assert.equal(harness.document.body.textContent.includes(marker), false);
+});
+
+test("fake small Content-Length cannot authorize a huge arrayBuffer", async () => {
+  const marker = "HUGE_ARRAY_BUFFER_MARKER";
+  const raw = JSON.stringify({
+    ...defaultTree,
+    pad: "x".repeat(JSON_RESPONSE_BYTE_LIMIT + 1),
+    marker,
+  });
+  const stats = {};
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return configuredMeta();
+    }
+    if (url.startsWith("/api/tree")) {
+      return byteResponse(raw, {
+        body: false,
+        contentLength: "12",
+        stats,
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  assert.match(
+    harness.document.getElementById("tree-status").textContent,
+    /响应流不可用/,
+  );
+  assert.equal(stats.arrayBufferCalls, 0);
+  assert.equal(stats.textCalls, 0);
+  assert.equal(harness.document.body.textContent.includes(marker), false);
+});
+
+test("malformed UTF-8 is rejected by fatal decoding", async () => {
+  const stats = {};
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return configuredMeta();
+    }
+    if (url.startsWith("/api/tree")) {
+      return byteResponse("not-used", {
+        chunks: [new Uint8Array([0x7b, 0x22, 0xc3, 0x28, 0x7d])],
+        contentLength: null,
+        stats,
+      });
     }
     throw new Error(`unexpected fetch: ${url}`);
   });
 
   assert.equal(
     harness.document.getElementById("tree-status").textContent,
-    "工作区为空",
+    "服务返回了无法识别的数据",
   );
-  assert.equal(stats.arrayBufferCalls, 1);
+  assert.equal(stats.reads, 2);
   assert.equal(stats.textCalls, 0);
 });
 
