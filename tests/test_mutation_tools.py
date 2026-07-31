@@ -1,3 +1,4 @@
+import copy
 import importlib
 import os
 import subprocess
@@ -602,97 +603,152 @@ def test_mutations_reject_multi_parent_junction_substitution(
     assert not list(root.rglob("*.tmp"))
 
 
+_TOOL_SCHEMA_CONTRACTS = {
+    "list_dir": {
+        "required": [],
+        "properties": {
+            "path": {"type": "string", "default": "."},
+            "recursive": {"type": "boolean", "default": False},
+            "cursor": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": None,
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "default": 100,
+            },
+        },
+    },
+    "search_files": {
+        "required": ["query"],
+        "properties": {
+            "query": {"type": "string", "minLength": 1},
+            "path": {"type": "string", "default": "."},
+            "cursor": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": None,
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 50,
+            },
+            "case_sensitive": {
+                "type": "boolean",
+                "default": True,
+            },
+        },
+    },
+    "read_file": {
+        "required": ["path"],
+        "properties": {
+            "path": {"type": "string"},
+            "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 2**63 - 1,
+                "default": 0,
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2**31 - 1,
+            },
+            "cursor": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "default": None,
+            },
+        },
+    },
+    "stat_path": {
+        "required": ["path"],
+        "properties": {
+            "path": {"type": "string"},
+        },
+    },
+    "write_file": {
+        "required": ["path", "content"],
+        "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+            "overwrite": {"type": "boolean", "default": False},
+        },
+    },
+    "move_file": {
+        "required": ["source", "destination"],
+        "properties": {
+            "source": {"type": "string"},
+            "destination": {"type": "string"},
+        },
+    },
+}
+
+
+def _assert_tool_schema_contract(schema: dict[str, Any]) -> None:
+    assert set(schema) == {"type", "function"}, (
+        f"schema top-level keys were {sorted(schema)}"
+    )
+    function = schema["function"]
+    name = function.get("name", "<missing>")
+    assert name in _TOOL_SCHEMA_CONTRACTS, f"unknown schema name {name!r}"
+    assert schema["type"] == "function", f"{name}.type"
+    assert set(function) == {
+        "name",
+        "description",
+        "parameters",
+    }, f"{name}.function keys were {sorted(function)}"
+    assert isinstance(function["description"], str) and function[
+        "description"
+    ].strip(), f"{name}.description"
+
+    parameters = function["parameters"]
+    assert set(parameters) == {
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+    }, f"{name}.parameters keys were {sorted(parameters)}"
+    assert parameters["type"] == "object", f"{name}.parameters.type"
+    assert parameters["additionalProperties"] is False, (
+        f"{name}.parameters.additionalProperties"
+    )
+
+    expected = _TOOL_SCHEMA_CONTRACTS[name]
+    assert parameters["required"] == expected["required"], (
+        f"{name}.required was {parameters['required']!r}"
+    )
+    properties = parameters["properties"]
+    assert set(properties) == set(expected["properties"]), (
+        f"{name}.properties were {sorted(properties)}; expected "
+        f"{sorted(expected['properties'])}"
+    )
+    for field, expected_definition in expected["properties"].items():
+        actual_definition = dict(properties[field])
+        description = actual_definition.pop("description", None)
+        assert isinstance(description, str) and description.strip(), (
+            f"{name}.{field}.description"
+        )
+        assert actual_definition == expected_definition, (
+            f"{name}.{field} contract was {actual_definition!r}; "
+            f"expected {expected_definition!r}"
+        )
+
+
 def test_tool_schemas_match_exact_contract() -> None:
     schemas = _tools_module().TOOL_SCHEMAS
-    expected_names = {
-        "list_dir",
-        "search_files",
-        "read_file",
-        "stat_path",
-        "write_file",
-        "move_file",
-    }
     by_name = {
         schema["function"]["name"]: schema
         for schema in schemas
     }
     assert len(schemas) == 6, f"schema count was {len(schemas)}"
-    assert set(by_name) == expected_names, (
+    assert set(by_name) == set(_TOOL_SCHEMA_CONTRACTS), (
         f"schema names were {sorted(by_name)}"
     )
-
-    required = {
-        "list_dir": [],
-        "search_files": ["query"],
-        "read_file": ["path"],
-        "stat_path": ["path"],
-        "write_file": ["path", "content"],
-        "move_file": ["source", "destination"],
-    }
-    defaults = {
-        "list_dir": {
-            "path": ".",
-            "recursive": False,
-            "cursor": None,
-            "limit": 100,
-        },
-        "search_files": {
-            "path": ".",
-            "cursor": None,
-            "limit": 50,
-            "case_sensitive": True,
-        },
-        "read_file": {"offset": 0, "cursor": None},
-        "stat_path": {},
-        "write_file": {"overwrite": False},
-        "move_file": {},
-    }
-    numeric_bounds = {
-        "list_dir": {"limit": (1, 200)},
-        "search_files": {"limit": (1, 100)},
-        "read_file": {
-            "offset": (0, 2**63 - 1),
-            "limit": (1, 2**31 - 1),
-        },
-    }
-
-    for name in sorted(expected_names):
-        schema = by_name[name]
-        parameters = schema["function"]["parameters"]
-        properties = parameters["properties"]
-        assert schema["type"] == "function", f"{name}.type"
-        assert parameters["type"] == "object", f"{name}.parameters.type"
-        assert parameters["additionalProperties"] is False, (
-            f"{name}.parameters.additionalProperties"
-        )
-        assert parameters["required"] == required[name], f"{name}.required"
-        actual_defaults = {
-            field: definition["default"]
-            for field, definition in properties.items()
-            if "default" in definition
-        }
-        assert actual_defaults == defaults[name], (
-            f"{name}.defaults were {actual_defaults!r}"
-        )
-        for field, (minimum, maximum) in numeric_bounds.get(
-            name,
-            {},
-        ).items():
-            assert properties[field]["minimum"] == minimum, (
-                f"{name}.{field}.minimum"
-            )
-            assert properties[field]["maximum"] == maximum, (
-                f"{name}.{field}.maximum"
-            )
-
-    for name in ("list_dir", "search_files", "read_file"):
-        cursor = by_name[name]["function"]["parameters"]["properties"][
-            "cursor"
-        ]
-        cursor_types = {
-            choice["type"] for choice in cursor["anyOf"]
-        }
-        assert cursor_types == {"string", "null"}, f"{name}.cursor.anyOf"
+    for name in _TOOL_SCHEMA_CONTRACTS:
+        _assert_tool_schema_contract(by_name[name])
 
     forbidden = {"root", "workspaceid", "shell", "delete"}
 
@@ -706,6 +762,17 @@ def test_tool_schemas_match_exact_contract() -> None:
                 assert_allowed_keys(child, f"{location}[{index}]")
 
     assert_allowed_keys(schemas, "TOOL_SCHEMAS")
+
+
+def test_tool_schema_contract_rejects_unexpected_optional_property() -> None:
+    schema = copy.deepcopy(_tools_module().TOOL_SCHEMAS[0])
+    schema["function"]["parameters"]["properties"]["unexpected"] = {
+        "type": "string",
+        "description": "Unexpected optional field.",
+    }
+
+    with pytest.raises(AssertionError, match=r"list_dir\.properties"):
+        _assert_tool_schema_contract(schema)
 
 
 def test_execute_dispatches_all_six_tools(tmp_path: Path) -> None:
