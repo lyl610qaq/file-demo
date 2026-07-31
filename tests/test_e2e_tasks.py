@@ -167,16 +167,16 @@ async def test_t1_agent_changes_only_falcon_index_and_traces_steps(
     traces = tmp_path / "traces"
     materialize_demo_seed(root)
     before = tree_hashes(root)
-    index = (
-        "# Project Falcon / Aquila 索引\n\n"
+    expected_index = (
         "当前正式名称：Aquila\n\n"
         "## 2026-01\n\n"
-        "- meetings/falcon-kickoff.md - 项目以 Project Falcon 工作名启动。\n\n"
+        "- meetings/falcon-kickoff.md — 项目正式启动并确定初始目标。\n\n"
         "## 2026-02\n\n"
-        "- notes/falcon-risk.md - 供应商安全评审是当前依赖。\n\n"
+        "- notes/falcon-risk.md — 项目仍依赖供应商安全评审。\n\n"
         "## 2026-03\n\n"
-        "- meetings/falcon-rename.md - 正式名称更新为 Aquila。\n"
+        "- meetings/falcon-rename.md — 最新会议将正式名称更新为 Aquila。\n"
     )
+    index = expected_index
     runner = make_runner(
         root,
         traces,
@@ -247,7 +247,9 @@ async def test_t1_agent_changes_only_falcon_index_and_traces_steps(
         if before.get(path) != after.get(path)
     }
     assert changed == {"falcon_index.md"}
-    assert (root / "falcon_index.md").read_text(encoding="utf-8") == index
+    assert (root / "falcon_index.md").read_text(
+        encoding="utf-8"
+    ) == expected_index
 
     records = trace_records(traces, result.run_id)
     assert [record["tool"] for record in records[:-1]] == [
@@ -275,8 +277,11 @@ async def test_t1_agent_changes_only_falcon_index_and_traces_steps(
     write_record = records[-2]
     assert "content" not in write_record["args"]
     assert write_record["args"]["content_sha256"] == hashlib.sha256(
-        index.encode("utf-8")
+        expected_index.encode("utf-8")
     ).hexdigest()
+    assert write_record["args"]["content_bytes"] == len(
+        expected_index.encode("utf-8")
+    )
     assert index not in (traces / f"{result.run_id}.jsonl").read_text(
         encoding="utf-8"
     )
@@ -290,11 +295,8 @@ async def test_t2_agent_uses_content_status_and_only_archives_obsolete_files(
     traces = tmp_path / "traces"
     materialize_demo_seed(root)
     before = tree_hashes(root)
-    manifest = (
-        "# Archived obsolete drafts\n\n"
-        "- current-name.md\n"
-        "- old-outline.md\n"
-    )
+    expected_manifest = "- current-name.md\n- old-outline.md\n"
+    manifest = expected_manifest
     runner = make_runner(
         root,
         traces,
@@ -399,7 +401,7 @@ async def test_t2_agent_uses_content_status_and_only_archives_obsolete_files(
     assert (root / "drafts" / "active-plan.md").exists()
     assert (root / "archive" / "MANIFEST.md").read_text(
         encoding="utf-8"
-    ) == manifest
+    ) == expected_manifest
 
     records = trace_records(traces, result.run_id)
     assert len(records) == 9
@@ -407,6 +409,12 @@ async def test_t2_agent_uses_content_status_and_only_archives_obsolete_files(
     assert records[-1]["type"] == "run_status"
     assert records[-1]["status"] == "completed"
     assert "content" not in records[-2]["args"]
+    assert records[-2]["args"]["content_sha256"] == hashlib.sha256(
+        expected_manifest.encode("utf-8")
+    ).hexdigest()
+    assert records[-2]["args"]["content_bytes"] == len(
+        expected_manifest.encode("utf-8")
+    )
     assert manifest not in (traces / f"{result.run_id}.jsonl").read_text(
         encoding="utf-8"
     )
