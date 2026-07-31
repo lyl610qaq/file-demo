@@ -540,27 +540,41 @@ def _validate_reset_journal_record(
     record: object,
     workspace_name: object,
 ) -> dict[str, Any]:
-    if not isinstance(record, dict) or set(record) != {
+    required = {
         "version",
         "workspace",
         "staging",
         "backup",
         "phase",
-    }:
+    }
+    if not isinstance(record, dict):
+        raise ValueError("invalid reset journal")
+    version = record.get("version")
+    if version == 1 and set(record) == required:
+        normalized = dict(record)
+        normalized["workspace_was_empty"] = False
+    elif (
+        version == 2
+        and set(record) == required | {"workspace_was_empty"}
+        and isinstance(record.get("workspace_was_empty"), bool)
+    ):
+        normalized = dict(record)
+    else:
         raise ValueError("invalid reset journal")
     if (
-        record.get("version") != 1
-        or not isinstance(workspace_name, str)
-        or record.get("workspace") != workspace_name
-        or not isinstance(record.get("staging"), str)
-        or _RESET_STAGING_PATTERN.fullmatch(record["staging"]) is None
-        or not isinstance(record.get("backup"), str)
-        or _RESET_BACKUP_PATTERN.fullmatch(record["backup"]) is None
-        or record["staging"] == record["backup"]
-        or record.get("phase") not in _RESET_PHASES
+        not isinstance(workspace_name, str)
+        or normalized.get("workspace") != workspace_name
+        or not isinstance(normalized.get("staging"), str)
+        or _RESET_STAGING_PATTERN.fullmatch(normalized["staging"])
+        is None
+        or not isinstance(normalized.get("backup"), str)
+        or _RESET_BACKUP_PATTERN.fullmatch(normalized["backup"])
+        is None
+        or normalized["staging"] == normalized["backup"]
+        or normalized.get("phase") not in _RESET_PHASES
     ):
         raise ValueError("invalid reset journal")
-    return record
+    return normalized
 
 
 def _load_reset_journal(parent: Path, workspace_name: str) -> dict[str, Any]:
@@ -677,16 +691,40 @@ def _restore_reset_backup(
     workspace: Path,
     staging: Path,
     backup: Path,
+    *,
+    allow_empty_workspace: bool,
 ) -> None:
-    _validate_recovery_directory(backup)
-    if os.path.lexists(staging):
-        _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
+    _validate_physical_tree(
+        backup,
+        require_nonempty=not allow_empty_workspace,
+    )
     if os.path.lexists(workspace):
+        if os.path.lexists(staging):
+            _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
         _validate_recovery_directory(workspace)
         os.replace(workspace, staging)
         _fsync_directory(parent)
     os.replace(backup, workspace)
     _fsync_directory(parent)
+    _finish_restored_backup(
+        parent,
+        workspace,
+        staging,
+        allow_empty_workspace=allow_empty_workspace,
+    )
+
+
+def _finish_restored_backup(
+    parent: Path,
+    workspace: Path,
+    staging: Path,
+    *,
+    allow_empty_workspace: bool,
+) -> None:
+    _validate_physical_tree(
+        workspace,
+        require_nonempty=not allow_empty_workspace,
+    )
     if os.path.lexists(staging):
         _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
         _fsync_directory(parent)
@@ -711,6 +749,7 @@ def _recover_journaled_reset(
         _RESET_BACKUP_PATTERN,
     )
     phase = record["phase"]
+    allow_empty_workspace = record["workspace_was_empty"]
     workspace_exists = os.path.lexists(workspace)
     staging_exists = os.path.lexists(staging)
     backup_exists = os.path.lexists(backup)
@@ -723,13 +762,14 @@ def _recover_journaled_reset(
         if exists:
             _validate_recovery_directory(candidate)
 
-    if phase in {"prepared", "backup-created"}:
+    if phase == "prepared":
         if backup_exists:
             _restore_reset_backup(
                 parent,
                 workspace,
                 staging,
                 backup,
+                allow_empty_workspace=allow_empty_workspace,
             )
             return
         if phase == "prepared" and workspace_exists:
@@ -738,6 +778,26 @@ def _recover_journaled_reset(
                 _fsync_directory(parent)
             _remove_reset_journal(parent)
             _cleanup_journal_temps(parent)
+            return
+        raise ValueError("inconsistent reset journal")
+
+    if phase == "backup-created":
+        if backup_exists:
+            _restore_reset_backup(
+                parent,
+                workspace,
+                staging,
+                backup,
+                allow_empty_workspace=allow_empty_workspace,
+            )
+            return
+        if workspace_exists:
+            _finish_restored_backup(
+                parent,
+                workspace,
+                staging,
+                allow_empty_workspace=allow_empty_workspace,
+            )
             return
         raise ValueError("inconsistent reset journal")
 
@@ -761,7 +821,13 @@ def _recover_journaled_reset(
         _cleanup_journal_temps(parent)
         return
     if backup_exists:
-        _restore_reset_backup(parent, workspace, staging, backup)
+        _restore_reset_backup(
+            parent,
+            workspace,
+            staging,
+            backup,
+            allow_empty_workspace=allow_empty_workspace,
+        )
         return
     raise ValueError("inconsistent reset journal")
 
@@ -864,6 +930,7 @@ def _reset_workspace(settings: Settings) -> None:
         seed_guard = WorkspaceGuard(settings.seed_root)
         workspace = workspace_guard.root
         parent = workspace.parent
+        workspace_was_empty = _directory_is_empty(workspace)
         staging = parent / f".workspace-reset-stage-{uuid.uuid4().hex}"
         backup = parent / f".workspace-reset-backup-{uuid.uuid4().hex}"
         os.mkdir(staging)
@@ -879,11 +946,12 @@ def _reset_workspace(settings: Settings) -> None:
         raise _ResetError() from None
 
     journal = {
-        "version": 1,
+        "version": 2,
         "workspace": workspace.name,
         "staging": staging.name,
         "backup": backup.name,
         "phase": "prepared",
+        "workspace_was_empty": workspace_was_empty,
     }
     try:
         _write_reset_journal(parent, journal)

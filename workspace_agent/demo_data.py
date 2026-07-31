@@ -70,9 +70,6 @@ CORE_FILES: dict[str, str] = {
     ),
 }
 
-CORE_DIRECTORIES = ("security",)
-
-
 def demo_files() -> dict[str, str]:
     files = dict(CORE_FILES)
     for number in range(1, 25):
@@ -167,11 +164,6 @@ def _validate_empty_target(target: Path) -> bool:
 
 
 def _write_demo_files(root: Path, files: dict[str, str]) -> None:
-    for relative in CORE_DIRECTORIES:
-        pure = PurePosixPath(relative)
-        if pure.is_absolute() or ".." in pure.parts or not pure.parts:
-            raise ValueError("demo seed contains an invalid directory")
-        root.joinpath(*pure.parts).mkdir(parents=True, exist_ok=True)
     for relative, content in files.items():
         pure = PurePosixPath(relative)
         if pure.is_absolute() or ".." in pure.parts or not pure.parts:

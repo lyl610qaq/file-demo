@@ -1762,6 +1762,121 @@ def test_create_app_finishes_installed_workspace_after_cleanup_crash(
     assert reset_artifacts(tmp_path) == []
 
 
+def _backup_created_reset_state(
+    settings: Settings,
+) -> tuple[Path, Path]:
+    from workspace_agent import web
+
+    parent = settings.workspace_root.parent
+    staging = parent / (".workspace-reset-stage-" + "a" * 32)
+    backup = parent / (".workspace-reset-backup-" + "b" * 32)
+    shutil.copytree(settings.seed_root, staging)
+    os.replace(settings.workspace_root, backup)
+    web._write_reset_journal(
+        parent,
+        {
+            "version": 1,
+            "workspace": settings.workspace_root.name,
+            "staging": staging.name,
+            "backup": backup.name,
+            "phase": "backup-created",
+        },
+    )
+    return staging, backup
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "after-restore-rename",
+        "after-staging-cleanup",
+        "before-journal-cleanup",
+    ],
+)
+def test_create_app_restartably_finishes_interrupted_backup_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    staging, backup = _backup_created_reset_state(settings)
+
+    with monkeypatch.context() as patcher:
+        if checkpoint == "after-restore-rename":
+            original_replace = web.os.replace
+
+            def crash_after_restore_rename(
+                source: str | Path,
+                destination: str | Path,
+            ) -> None:
+                original_replace(source, destination)
+                if Path(source) == backup and Path(destination) == settings.workspace_root:
+                    raise SimulatedCrash()
+
+            patcher.setattr(web.os, "replace", crash_after_restore_rename)
+        elif checkpoint == "after-staging-cleanup":
+            original_cleanup = web._cleanup_recovery_directory
+
+            def crash_after_staging_cleanup(
+                path: Path,
+                pattern,
+            ) -> None:
+                original_cleanup(path, pattern)
+                if path == staging and settings.workspace_root.exists():
+                    raise SimulatedCrash()
+
+            patcher.setattr(
+                web,
+                "_cleanup_recovery_directory",
+                crash_after_staging_cleanup,
+            )
+        else:
+            def crash_before_journal_cleanup(parent: Path) -> None:
+                raise SimulatedCrash()
+
+            patcher.setattr(
+                web,
+                "_remove_reset_journal",
+                crash_before_journal_cleanup,
+            )
+
+        with pytest.raises(SimulatedCrash):
+            web._recover_workspace_state(settings)
+
+    create_app(settings, model=FinalOnlyModel())
+    create_app(settings, model=FinalOnlyModel())
+
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert not (settings.workspace_root / "seed.md").exists()
+    assert reset_artifacts(tmp_path) == []
+
+
+def test_create_app_refuses_empty_restored_workspace_without_backup(
+    tmp_path: Path,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    staging, backup = _backup_created_reset_state(settings)
+    settings.workspace_root.mkdir()
+    shutil.rmtree(backup)
+
+    with pytest.raises(
+        ValueError,
+        match="^workspace recovery failed$",
+    ):
+        create_app(settings, model=FinalOnlyModel())
+
+    assert staging.is_dir()
+    assert (tmp_path / ".workspace-reset-journal.json").is_file()
+    assert settings.workspace_root.is_dir()
+    assert list(settings.workspace_root.iterdir()) == []
+
+
 def test_create_app_rejects_traversal_in_reset_journal_without_touching_outside(
     tmp_path: Path,
 ) -> None:

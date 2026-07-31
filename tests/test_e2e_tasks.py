@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import subprocess
+import tarfile
 import tracemalloc
 from pathlib import Path
 from typing import Any
@@ -120,16 +121,31 @@ def assert_physical_seed_tree(root: Path) -> None:
         assert stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
 
 
-def test_demo_seed_asset_matches_generator_byte_for_byte(
+def test_demo_seed_matches_clean_git_archive(
     tmp_path: Path,
 ) -> None:
     generated = tmp_path / "generated"
+    archive_path = tmp_path / "seed.tar"
+    extracted = tmp_path / "archive"
+
+    with archive_path.open("wb") as stream:
+        archived = subprocess.run(
+            ["git", "archive", "--format=tar", "HEAD", "demo_workspace_seed"],
+            cwd=ASSET_SEED.parent,
+            stdout=stream,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    assert archived.returncode == 0, archived.stderr.decode("utf-8")
+    with tarfile.open(archive_path) as archive:
+        archive.extractall(extracted)
 
     materialize_demo_seed(generated)
 
-    assert tree_bytes(generated) == tree_bytes(ASSET_SEED)
-    assert tree_hashes(generated) == tree_hashes(ASSET_SEED)
-    assert tree_snapshot(generated) == tree_snapshot(ASSET_SEED)
+    archived_seed = extracted / "demo_workspace_seed"
+    assert tree_bytes(generated) == tree_bytes(archived_seed)
+    assert tree_hashes(generated) == tree_hashes(archived_seed)
+    assert tree_snapshot(generated) == tree_snapshot(archived_seed)
 
 
 def test_tree_snapshot_keeps_empty_directories_and_does_not_follow_links(
