@@ -511,6 +511,33 @@ def _reset_workspace(settings: Settings) -> None:
         raise _ResetError() from None
 
 
+def _directory_is_empty(root: Path) -> bool:
+    try:
+        metadata = os.lstat(root)
+        if _is_link_or_reparse(metadata) or not stat.S_ISDIR(
+            metadata.st_mode
+        ):
+            raise ValueError("workspace initialization failed")
+        with os.scandir(root) as entries:
+            return next(entries, None) is None
+    except OSError:
+        raise ValueError("workspace initialization failed") from None
+
+
+def _initialize_workspace_if_empty(
+    settings: Settings,
+    guard: WorkspaceGuard,
+) -> WorkspaceGuard:
+    if not _directory_is_empty(guard.root):
+        return guard
+    try:
+        _reset_workspace(settings)
+        refreshed, _ = _prepare_runtime_roots(settings)
+    except (OSError, ValueError, _ResetError):
+        raise ValueError("workspace initialization failed") from None
+    return refreshed
+
+
 async def _run_thread_worker(
     function: Callable[..., Any],
     *arguments: Any,
@@ -820,6 +847,7 @@ def create_app(
         configured.trusted_proxy_cidrs
     )
     guard, _ = _prepare_runtime_roots(configured)
+    guard = _initialize_workspace_if_empty(configured, guard)
     tools = WorkspaceTools(
         guard,
         max_read_bytes=configured.max_read_bytes,

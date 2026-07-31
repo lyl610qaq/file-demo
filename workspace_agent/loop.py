@@ -139,6 +139,7 @@ class AgentRunner:
                     model_calls,
                     usage,
                     sink,
+                    writer,
                 )
 
             model_calls += 1
@@ -161,6 +162,7 @@ class AgentRunner:
                     model_calls,
                     usage,
                     sink,
+                    writer,
                 )
 
             usage = usage.plus(reply.usage)
@@ -185,6 +187,7 @@ class AgentRunner:
                         model_calls,
                         usage,
                         sink,
+                        writer,
                     )
                 if (
                     total_tool_calls + response_tool_calls
@@ -196,6 +199,7 @@ class AgentRunner:
                         model_calls,
                         usage,
                         sink,
+                        writer,
                     )
                 total_tool_calls += response_tool_calls
 
@@ -223,6 +227,7 @@ class AgentRunner:
                             model_calls,
                             usage,
                             sink,
+                            writer,
                         )
 
                     step += 1
@@ -299,6 +304,7 @@ class AgentRunner:
                             model_calls,
                             usage,
                             sink,
+                            writer,
                         )
                     aggregate_result_bytes += len(
                         model_payload.encode("utf-8")
@@ -313,6 +319,7 @@ class AgentRunner:
                             model_calls,
                             usage,
                             sink,
+                            writer,
                         )
                     messages.append(
                         {
@@ -340,6 +347,11 @@ class AgentRunner:
                     model_calls=model_calls,
                     usage=usage,
                 )
+                writer.append_run_status(
+                    status="completed",
+                    model_calls=model_calls,
+                    usage=usage.as_dict(),
+                )
                 await _emit(
                     sink,
                     {
@@ -361,6 +373,7 @@ class AgentRunner:
                     model_calls,
                     usage,
                     sink,
+                    writer,
                 )
             messages.append(
                 {"role": "user", "content": _EMPTY_REPLY_CORRECTION}
@@ -416,6 +429,7 @@ class AgentRunner:
         model_calls: int,
         usage: Usage,
         sink: EventSink,
+        writer: TraceWriter,
     ) -> RunResult:
         result = RunResult(
             run_id=run_id,
@@ -423,6 +437,11 @@ class AgentRunner:
             message=message,
             model_calls=model_calls,
             usage=usage,
+        )
+        writer.append_run_status(
+            status="failed",
+            model_calls=model_calls,
+            usage=usage.as_dict(),
         )
         await _emit(
             sink,

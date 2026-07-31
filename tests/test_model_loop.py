@@ -910,10 +910,13 @@ async def test_agent_loop_executes_tool_then_final_and_closes_trace(
         json.loads(line)
         for line in writer.path.read_text(encoding="utf-8").splitlines()
     ]
-    assert len(records) == 1
+    assert len(records) == 2
     assert records[0]["tool"] == "read_file"
     assert records[0]["args"] == {"path": "note.txt", "limit": 100}
     assert records[0]["status"] == "success"
+    assert records[1]["type"] == "run_status"
+    assert records[1]["status"] == "completed"
+    assert records[1]["model_calls"] == 2
     with pytest.raises(ValueError, match="closed"):
         writer.append(
             step=2,
@@ -1065,7 +1068,12 @@ async def test_agent_loop_blocks_third_identical_consecutive_tool_execution(
             encoding="utf-8"
         ).splitlines()
     ]
-    assert [record["status"] for record in records] == ["error", "error"]
+    assert [record["status"] for record in records[:-1]] == [
+        "error",
+        "error",
+    ]
+    assert records[-1]["type"] == "run_status"
+    assert records[-1]["status"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -1671,12 +1679,15 @@ async def test_agent_loop_sanitizes_write_content_in_events_and_trace(
             content.encode("utf-8")
         ).hexdigest(),
     }
-    trace_record = json.loads(
-        traces.writers[0].path.read_text(encoding="utf-8")
-    )
+    trace_text = traces.writers[0].path.read_text(encoding="utf-8")
+    trace_records = [
+        json.loads(line) for line in trace_text.splitlines()
+    ]
+    trace_record = trace_records[0]
     assert trace_record["args"] == started["args"]
+    assert trace_records[-1]["status"] == "completed"
     assert content not in json.dumps(events, ensure_ascii=False)
-    assert content not in traces.writers[0].path.read_text(encoding="utf-8")
+    assert content not in trace_text
 
 
 @pytest.mark.asyncio
@@ -1728,8 +1739,12 @@ async def test_agent_loop_drops_unknown_tool_arguments_from_events_and_trace(
     )
     assert finished["ok"] is False
     trace_text = traces.writers[0].path.read_text(encoding="utf-8")
-    trace_record = json.loads(trace_text)
+    trace_records = [
+        json.loads(line) for line in trace_text.splitlines()
+    ]
+    trace_record = trace_records[0]
     assert trace_record["args"] == expected_args
+    assert trace_records[-1]["status"] == "completed"
     assert secret not in json.dumps(events, ensure_ascii=False)
     assert secret not in trace_text
 
@@ -1802,10 +1817,14 @@ async def test_agent_loop_recovers_from_safely_redacted_malformed_write_content(
     assert tool_payload["ok"] is False
     assert tool_payload["error_code"] == "INVALID_INPUT"
     trace_text = traces.writers[0].path.read_text(encoding="utf-8")
-    trace_record = json.loads(trace_text)
+    trace_records = [
+        json.loads(line) for line in trace_text.splitlines()
+    ]
+    trace_record = trace_records[0]
     assert trace_record["status"] == "error"
     assert trace_record["args"]["content_type"] == content_type
     assert trace_record["args"]["content_size"] == content_size
+    assert trace_records[-1]["status"] == "completed"
     assert secret not in json.dumps(events, ensure_ascii=False)
     assert secret not in trace_text
 

@@ -62,6 +62,28 @@ class TraceWriter:
         }
         if error_code is not None:
             record["error_code"] = error_code
+        self._append_record(record)
+
+    def append_run_status(
+        self,
+        *,
+        status: str,
+        model_calls: int,
+        usage: dict[str, int | None],
+    ) -> None:
+        if status not in {"completed", "failed"}:
+            raise ValueError("invalid run status")
+        self._append_record(
+            {
+                "type": "run_status",
+                "status": status,
+                "model_calls": model_calls,
+                "usage": dict(usage),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    def _append_record(self, record: dict[str, Any]) -> None:
         line = json.dumps(
             record,
             ensure_ascii=False,

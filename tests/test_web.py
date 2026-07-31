@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from workspace_agent.config import Settings
+from workspace_agent.demo_data import materialize_demo_seed
 from workspace_agent.schemas import ModelReply, ToolCall, ToolResult, Usage
 from workspace_agent.web import SlidingWindowLimiter, create_app
 
@@ -98,6 +99,12 @@ def settings_for(tmp_path: Path, **overrides: Any) -> Settings:
     }
     values.update(overrides)
     return Settings(**values)
+
+
+def empty_settings_for(tmp_path: Path, **overrides: Any) -> Settings:
+    settings = settings_for(tmp_path, **overrides)
+    (settings.workspace_root / "a.md").unlink()
+    return settings
 
 
 def tool_reply(call: ToolCall) -> ModelReply:
@@ -2023,3 +2030,108 @@ def test_sliding_window_limiter_is_thread_safe() -> None:
         allowed = list(pool.map(lambda _: limiter.allow("same"), range(100)))
 
     assert sum(allowed) == 5
+
+
+def test_default_settings_initialize_an_empty_workspace_from_demo_seed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    for name in (
+        "WORKSPACE_ROOT",
+        "SEED_ROOT",
+        "TRACE_ROOT",
+        "STATIC_ROOT",
+        "ALLOWED_ORIGIN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    materialize_demo_seed(tmp_path / "demo_workspace_seed")
+    (tmp_path / "static").mkdir()
+    (tmp_path / "static" / "index.html").write_text(
+        "<main>demo</main>",
+        encoding="utf-8",
+    )
+
+    app = create_app(model=FinalOnlyModel())
+
+    assert app.state.settings.workspace_root == tmp_path / "workspace"
+    assert (
+        app.state.settings.workspace_root / "meetings" / "falcon-kickoff.md"
+    ).is_file()
+    assert len(
+        [
+            path
+            for path in app.state.settings.workspace_root.rglob("*")
+            if path.is_file()
+        ]
+    ) >= 30
+
+
+def test_custom_settings_initialize_an_empty_workspace_from_valid_seed(
+    tmp_path: Path,
+) -> None:
+    settings = empty_settings_for(tmp_path)
+
+    app = create_app(settings, model=FinalOnlyModel())
+
+    assert (settings.workspace_root / "seed.md").read_text(
+        encoding="utf-8"
+    ) == "seed"
+    assert app.state.tools.guard.root == settings.workspace_root
+
+
+def test_create_app_never_overwrites_a_nonempty_workspace(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    nested = settings.workspace_root / "empty-directory"
+    nested.mkdir()
+
+    create_app(settings, model=FinalOnlyModel())
+
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert nested.is_dir()
+    assert not (settings.workspace_root / "seed.md").exists()
+
+
+def test_failed_initialization_restores_the_empty_workspace_without_path_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    settings = empty_settings_for(tmp_path)
+    original_identity = os.stat(settings.workspace_root).st_ino
+    original_replace = web.os.replace
+
+    def fail_stage_exchange(source: str | Path, destination: str | Path) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            source_path.name.startswith(".workspace-reset-stage-")
+            and destination_path == settings.workspace_root
+        ):
+            raise OSError(f"initialization failed at {tmp_path}")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(web.os, "replace", fail_stage_exchange)
+
+    with pytest.raises(
+        ValueError,
+        match="^workspace initialization failed$",
+    ) as error:
+        create_app(settings, model=FinalOnlyModel())
+
+    assert str(tmp_path) not in str(error.value)
+    assert settings.workspace_root.is_dir()
+    assert os.stat(settings.workspace_root).st_ino == original_identity
+    assert list(settings.workspace_root.iterdir()) == []
+    assert (settings.seed_root / "seed.md").read_text(
+        encoding="utf-8"
+    ) == "seed"
+    assert not any(
+        entry.name.startswith(".workspace-reset-")
+        for entry in tmp_path.iterdir()
+    )
