@@ -33,9 +33,18 @@
     treeCursor: null,
     collapsedPaths: new Set(),
     selectedPath: null,
+    activePane: "task",
+    treeGroupSequence: 0,
+    usage: {
+      modelCalls: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+    },
   };
 
   const byId = (id) => document.getElementById(id);
+  const mobileLayout = window.matchMedia("(max-width: 860px)");
 
   function isRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -63,7 +72,7 @@
   }
 
   function setModelStatus(text, kind) {
-    const node = byId("model-status");
+    const node = byId("model-name");
     node.textContent = text;
     node.dataset.state = kind;
   }
@@ -78,14 +87,36 @@
   }
 
   function activatePane(name) {
+    state.activePane = name;
+    const mobile = mobileLayout.matches;
     document.querySelectorAll("[data-pane]").forEach((node) => {
-      node.classList.toggle("active", node.dataset.pane === name);
+      const active = node.dataset.pane === name;
+      node.classList.toggle("active", active);
+      node.hidden = mobile && !active;
+      node.setAttribute("aria-hidden", String(mobile && !active));
     });
     document.querySelectorAll("[data-view]").forEach((button) => {
       const active = button.dataset.view === name;
       button.classList.toggle("active", active);
-      button.setAttribute("aria-current", active ? "page" : "false");
+      if (active) {
+        button.setAttribute("aria-current", "page");
+      } else {
+        button.removeAttribute("aria-current");
+      }
     });
+  }
+
+  function resetUsage() {
+    state.usage = {
+      modelCalls: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+    };
+    setText("usage-calls", "0");
+    setText("usage-prompt", "0");
+    setText("usage-completion", "0");
+    setText("usage-total", "0");
   }
 
   function refreshIcons() {
@@ -310,12 +341,10 @@
   function renderTreeGroup(node) {
     const group = document.createElement("ul");
     group.className = "tree-group";
-    group.setAttribute("role", "group");
 
     for (const child of sortedChildren(node)) {
       const item = document.createElement("li");
       item.className = "tree-item";
-      item.setAttribute("role", "treeitem");
       const button = document.createElement("button");
       button.type = "button";
       button.className = "file-row";
@@ -335,7 +364,8 @@
 
       if (child.type === "directory") {
         const collapsed = state.collapsedPaths.has(child.path);
-        item.setAttribute("aria-expanded", collapsed ? "false" : "true");
+        button.classList.add("directory-button");
+        button.setAttribute("aria-expanded", collapsed ? "false" : "true");
         chevron.textContent = collapsed ? "›" : "▾";
         button.setAttribute("aria-label", `${collapsed ? "展开" : "折叠"}目录 ${child.name}`);
         button.addEventListener("click", () => {
@@ -355,8 +385,12 @@
       }
 
       item.append(button);
-      if (child.type === "directory" && child.children.size) {
-        item.append(renderTreeGroup(child));
+      if (child.type === "directory") {
+        const childGroup = renderTreeGroup(child);
+        state.treeGroupSequence += 1;
+        childGroup.id = `tree-group-${state.treeGroupSequence}`;
+        button.setAttribute("aria-controls", childGroup.id);
+        item.append(childGroup);
       }
       group.append(item);
     }
@@ -380,6 +414,7 @@
   function renderTree() {
     const container = byId("file-tree");
     container.replaceChildren();
+    state.treeGroupSequence = 0;
     const tree = buildTree(state.treeEntries);
     container.append(renderTreeGroup(tree));
     refreshIcons();
@@ -615,8 +650,16 @@
     }
 
     if (event.type === "usage_updated") {
-      setText("usage-calls", safeCount(event.model_calls));
-      setText("usage-total", safeCount(event.usage.total_tokens));
+      state.usage = {
+        modelCalls: event.model_calls,
+        promptTokens: event.usage.prompt_tokens,
+        completionTokens: event.usage.completion_tokens,
+        totalTokens: event.usage.total_tokens,
+      };
+      setText("usage-calls", safeCount(state.usage.modelCalls));
+      setText("usage-prompt", safeCount(state.usage.promptTokens));
+      setText("usage-completion", safeCount(state.usage.completionTokens));
+      setText("usage-total", safeCount(state.usage.totalTokens));
       return;
     }
     if (event.type === "assistant_message") {
@@ -657,6 +700,7 @@
       return;
     }
 
+    resetUsage();
     state.running = true;
     resetTraceView();
     disableTraceDownload();
@@ -802,6 +846,8 @@
 
   document.addEventListener("DOMContentLoaded", async () => {
     bindInterface();
+    activatePane("task");
+    mobileLayout.addEventListener("change", () => activatePane(state.activePane));
     refreshIcons();
     disableTraceDownload();
     setControlsBusy();

@@ -1798,8 +1798,10 @@ def test_frontend_shell_exposes_three_pane_agent_controls(
     assert response.status_code == 200
     html = response.text
     for control_id in (
-        "model-status",
+        "model-name",
         "usage-calls",
+        "usage-prompt",
+        "usage-completion",
         "usage-total",
         "trace-download",
         "file-tree",
@@ -1820,6 +1822,12 @@ def test_frontend_shell_exposes_three_pane_agent_controls(
     assert 'data-pane="trace"' in html
     assert 'aria-live="polite"' in html
     assert 'lang="zh-CN"' in html
+    assert 'role="tree"' not in html
+    assert 'role="treeitem"' not in html
+    assert (
+        'class="active" data-view="task" aria-current="page"'
+        in html
+    )
 
 
 def test_frontend_assets_are_served_and_use_safe_browser_primitives(
@@ -1858,6 +1866,43 @@ def test_frontend_assets_are_served_and_use_safe_browser_primitives(
         "run_failed",
     ):
         assert f'"{event_type}"' in script
+
+
+def test_frontend_uses_native_tree_buttons_and_initializes_mobile_pane() -> (
+    None
+):
+    script = Path("static/app.js").read_text(encoding="utf-8")
+
+    assert 'button.setAttribute("aria-expanded"' in script
+    assert 'button.setAttribute("aria-controls"' in script
+    assert (
+        'child.type === "directory" && child.children.size'
+        not in script
+    )
+    assert 'item.setAttribute("aria-expanded"' not in script
+    assert 'group.setAttribute("role", "group")' not in script
+    assert 'activatePane("task")' in script
+    assert "node.hidden = mobile && !active" in script
+
+
+def test_frontend_clears_all_usage_before_opening_a_new_run() -> None:
+    script = Path("static/app.js").read_text(encoding="utf-8")
+    reset_start = script.index("function resetUsage()")
+    reset_end = script.index("\n  }", reset_start)
+    reset_body = script[reset_start:reset_end]
+    start_run = script.index("function startRun(task)")
+    socket_open = script.index("new WebSocket", start_run)
+    reset_call = script.index("resetUsage();", start_run)
+
+    assert "modelCalls: 0" in reset_body
+    assert "promptTokens: 0" in reset_body
+    assert "completionTokens: 0" in reset_body
+    assert "totalTokens: 0" in reset_body
+    assert 'setText("usage-calls", "0")' in reset_body
+    assert 'setText("usage-prompt", "0")' in reset_body
+    assert 'setText("usage-completion", "0")' in reset_body
+    assert 'setText("usage-total", "0")' in reset_body
+    assert start_run < reset_call < socket_open
 
 
 def test_frontend_styles_define_dense_responsive_and_reduced_motion_views() -> (

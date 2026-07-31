@@ -15,12 +15,14 @@
       <span class="brand-mark" aria-hidden="true">工</span>
       <div class="brand-copy">
         <strong>工作区智能体</strong>
-        <span id="model-status" class="model-status">正在连接模型</span>
+        <span id="model-name" class="model-status">正在连接模型</span>
       </div>
     </div>
     <div class="usage" aria-label="模型用量">
       <span>调用 <b id="usage-calls">0</b></span>
-      <span>Token <b id="usage-total">0</b></span>
+      <span>输入 <b id="usage-prompt">0</b></span>
+      <span>输出 <b id="usage-completion">0</b></span>
+      <span>合计 <b id="usage-total">0</b></span>
       <a
         id="trace-download"
         class="icon-button is-disabled"
@@ -38,7 +40,7 @@
 
   <nav class="mobile-tabs" aria-label="工作台视图">
     <button type="button" data-view="files" aria-controls="files-pane">文件</button>
-    <button type="button" class="active" data-view="task" aria-controls="task-pane">任务</button>
+    <button type="button" class="active" data-view="task" aria-current="page" aria-controls="task-pane">任务</button>
     <button type="button" data-view="trace" aria-controls="trace-pane">轨迹</button>
   </nav>
 
@@ -73,7 +75,7 @@
         </div>
       </div>
       <div id="tree-status" class="inline-state" role="status"></div>
-      <div id="file-tree" class="file-tree" role="tree" aria-label="工作区文件"></div>
+      <nav id="file-tree" class="file-tree" aria-label="工作区文件"></nav>
       <button id="tree-load-more" class="load-more" type="button" hidden>继续加载文件</button>
     </aside>
 

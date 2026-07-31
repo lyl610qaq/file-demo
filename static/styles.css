@@ -329,7 +329,7 @@ h2 {
   text-align: center;
 }
 
-.tree-item[aria-expanded="false"] > .tree-group {
+.directory-button[aria-expanded="false"] + .tree-group {
   display: none;
 }
 
