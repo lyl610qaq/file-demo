@@ -1106,6 +1106,39 @@ class WorkspaceTools:
                         "target already exists",
                         "TARGET_EXISTS",
                     ) from error
+                if not self._cleanup_owned_file(
+                    temp_relative,
+                    temp_identity,
+                ):
+                    rollback_succeeded = self._remove_owned_file(
+                        relative_path,
+                        temp_identity,
+                    )
+                    self._cleanup_owned_file(
+                        temp_relative,
+                        temp_identity,
+                    )
+                    target_exists = self._safe_path_exists(relative_path)
+                    temp_exists = self._safe_path_exists(temp_relative)
+                    temp_relative = None
+                    rollback_complete = (
+                        rollback_succeeded and not target_exists
+                    )
+                    code = (
+                        "WRITE_CLEANUP_FAILED"
+                        if rollback_complete
+                        else "WRITE_ROLLBACK_FAILED"
+                    )
+                    return _failure(
+                        code,
+                        "write_file failed: publication cleanup failed",
+                        {
+                            "path": relative_path,
+                            "target_exists": target_exists,
+                            "temp_exists": temp_exists,
+                        },
+                    )
+                temp_relative = None
 
             return _success(
                 {
@@ -1122,6 +1155,24 @@ class WorkspaceTools:
             ValueError,
             OSError,
         ) as error:
+            if temp_relative is not None and temp_identity is not None:
+                if not self._cleanup_owned_file(
+                    temp_relative,
+                    temp_identity,
+                ):
+                    target_exists = self._safe_path_exists(relative_path)
+                    temp_exists = self._safe_path_exists(temp_relative)
+                    temp_relative = None
+                    return _failure(
+                        "WRITE_CLEANUP_FAILED",
+                        "write_file failed: temporary cleanup failed",
+                        {
+                            "path": relative_path,
+                            "target_exists": target_exists,
+                            "temp_exists": temp_exists,
+                        },
+                    )
+                temp_relative = None
             return _mutation_error_result("write_file", error)
         finally:
             if descriptor is not None:
@@ -1201,8 +1252,26 @@ class WorkspaceTools:
                 ValueError,
                 OSError,
             ):
-                self._rollback_move(destination_relative, source_identity)
-                destination_created = False
+                rollback_succeeded = self._rollback_move(
+                    destination_relative,
+                    source_identity,
+                )
+                destination_created = not rollback_succeeded
+                if not rollback_succeeded:
+                    return _failure(
+                        "MOVE_ROLLBACK_FAILED",
+                        "move_file failed: destination rollback failed",
+                        {
+                            "source": source_relative,
+                            "destination": destination_relative,
+                            "source_exists": self._safe_path_exists(
+                                source_relative
+                            ),
+                            "destination_exists": self._safe_path_exists(
+                                destination_relative
+                            ),
+                        },
+                    )
                 return _failure(
                     "MOVE_FAILED",
                     "move_file failed: source could not be removed",
@@ -1229,10 +1298,26 @@ class WorkspaceTools:
                 and destination_relative is not None
                 and source_identity is not None
             ):
-                self._rollback_move(
+                rollback_succeeded = self._rollback_move(
                     destination_relative,
                     source_identity,
                 )
+                destination_created = not rollback_succeeded
+                if not rollback_succeeded:
+                    return _failure(
+                        "MOVE_ROLLBACK_FAILED",
+                        "move_file failed: destination rollback failed",
+                        {
+                            "source": source_relative,
+                            "destination": destination_relative,
+                            "source_exists": self._safe_path_exists(
+                                source_relative
+                            ),
+                            "destination_exists": self._safe_path_exists(
+                                destination_relative
+                            ),
+                        },
+                    )
             return _mutation_error_result("move_file", error)
 
     def execute(
@@ -1240,6 +1325,11 @@ class WorkspaceTools:
         name: str,
         arguments: dict[str, Any],
     ) -> ToolResult:
+        if not isinstance(name, str):
+            return _failure(
+                "INVALID_TOOL_NAME",
+                "tool execution failed: name must be a string",
+            )
         handlers: dict[str, Callable[..., ToolResult]] = {
             "list_dir": self.list_dir,
             "search_files": self.search_files,
@@ -1270,6 +1360,13 @@ class WorkspaceTools:
             OSError,
         ) as error:
             return _dispatch_error_result(name, error)
+        except MemoryError:
+            raise
+        except Exception:
+            return _failure(
+                "TOOL_EXECUTION_FAILED",
+                f"{name} failed: unexpected tool error",
+            )
 
     def _prepare_target(self, relative_path: str) -> tuple[str, str]:
         resolved = self.guard.resolve(relative_path, must_exist=False)
@@ -1367,17 +1464,20 @@ class WorkspaceTools:
                     descriptor,
                     (metadata.st_dev, metadata.st_ino),
                 )
-            except BaseException:
+            except BaseException as error:
                 try:
                     os.close(descriptor)
                 except OSError:
                     pass
+                cleanup_succeeded = False
                 try:
                     temp = self.guard.resolve(
                         temp_relative,
                         must_exist=True,
                     )
                     os.unlink(temp)
+                    _, remaining = self._optional_lstat(temp_relative)
+                    cleanup_succeeded = remaining is None
                 except (
                     FileNotFoundError,
                     PathRejected,
@@ -1387,6 +1487,12 @@ class WorkspaceTools:
                     OSError,
                 ):
                     pass
+                if not cleanup_succeeded:
+                    raise ToolInputError(
+                        "temporary file cleanup failed",
+                        "WRITE_CLEANUP_FAILED",
+                        {"temp_exists": True},
+                    ) from error
                 raise
             return ownership
         raise OSError("could not allocate temporary file")
@@ -1405,49 +1511,46 @@ class WorkspaceTools:
         self,
         relative_path: str,
         identity: tuple[int, int],
-    ) -> None:
+    ) -> bool:
+        return self._remove_owned_file(relative_path, identity)
+
+    def _remove_owned_file(
+        self,
+        relative_path: str,
+        identity: tuple[int, int],
+    ) -> bool:
         try:
-            resolved, metadata = self._optional_lstat(relative_path)
-            if metadata is None:
-                return
+            resolved, metadata = self._resolve_regular_file(relative_path)
             if (
                 _is_link_or_reparse(metadata)
-                or not stat.S_ISREG(metadata.st_mode)
                 or (metadata.st_dev, metadata.st_ino) != identity
             ):
-                return
-            resolved = self.guard.resolve(relative_path, must_exist=True)
+                return False
             os.unlink(resolved)
+            _, remaining = self._optional_lstat(relative_path)
+            return remaining is None
+        except FileNotFoundError:
+            return True
         except (
-            FileNotFoundError,
             PathRejected,
             ToolInputError,
             TypeError,
             ValueError,
             OSError,
         ):
-            return
+            return False
 
     def _rollback_move(
         self,
         destination: str,
         source_identity: tuple[int, int],
-    ) -> None:
+    ) -> bool:
+        return self._remove_owned_file(destination, source_identity)
+
+    def _safe_path_exists(self, relative_path: str) -> bool:
         try:
-            destination_path, metadata = self._optional_lstat(destination)
-            if metadata is None:
-                return
-            if (
-                _is_link_or_reparse(metadata)
-                or not stat.S_ISREG(metadata.st_mode)
-                or (metadata.st_dev, metadata.st_ino) != source_identity
-            ):
-                return
-            destination_path = self.guard.resolve(
-                destination,
-                must_exist=True,
-            )
-            os.unlink(destination_path)
+            _, metadata = self._optional_lstat(relative_path)
+            return metadata is not None
         except (
             FileNotFoundError,
             PathRejected,
@@ -1456,7 +1559,7 @@ class WorkspaceTools:
             ValueError,
             OSError,
         ):
-            return
+            return True
 
     def _resolve_regular_file(
         self,

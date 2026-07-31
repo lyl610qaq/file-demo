@@ -1,4 +1,5 @@
 import copy
+import errno
 import importlib
 import os
 import subprocess
@@ -188,6 +189,114 @@ def test_write_file_cleans_descriptor_and_temp_when_fstat_fails(
     assert list(root.iterdir()) == []
 
 
+def test_write_file_reports_persistent_temp_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "note.txt"
+    tools_module = _tools_module()
+    original_unlink = tools_module.os.unlink
+    temp_unlink_attempts = 0
+
+    def failing_temp_unlink(path, *args, **kwargs) -> None:
+        nonlocal temp_unlink_attempts
+        if Path(path).name.startswith(".note.txt."):
+            temp_unlink_attempts += 1
+            raise OSError("simulated persistent temp unlink failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(tools_module.os, "unlink", failing_temp_unlink)
+
+    result = _tools(root).write_file(path="note.txt", content="content")
+
+    temp_files = [
+        child
+        for child in root.iterdir()
+        if child.name.startswith(".note.txt.")
+    ]
+    assert result.ok is False
+    assert result.error_code == "WRITE_CLEANUP_FAILED"
+    assert result.data == {
+        "path": "note.txt",
+        "target_exists": False,
+        "temp_exists": True,
+    }
+    assert temp_unlink_attempts >= 2
+    assert not target.exists()
+    assert len(temp_files) == 1
+    assert temp_files[0].read_text(encoding="utf-8") == "content"
+    assert str(root) not in repr(result)
+
+
+def test_write_file_reports_target_rollback_failure_without_clobbering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    target = root / "note.txt"
+    tools_module = _tools_module()
+    original_unlink = tools_module.os.unlink
+
+    def failing_cleanup_and_rollback(path, *args, **kwargs) -> None:
+        candidate = Path(path)
+        if candidate == target or candidate.name.startswith(".note.txt."):
+            raise OSError("simulated cleanup rollback failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        tools_module.os,
+        "unlink",
+        failing_cleanup_and_rollback,
+    )
+
+    result = _tools(root).write_file(path="note.txt", content="content")
+
+    temp_files = [
+        child
+        for child in root.iterdir()
+        if child.name.startswith(".note.txt.")
+    ]
+    assert result.ok is False
+    assert result.error_code == "WRITE_ROLLBACK_FAILED"
+    assert result.data == {
+        "path": "note.txt",
+        "target_exists": True,
+        "temp_exists": True,
+    }
+    assert target.read_text(encoding="utf-8") == "content"
+    assert len(temp_files) == 1
+    target_metadata = os.stat(target)
+    temp_metadata = os.stat(temp_files[0])
+    assert (target_metadata.st_dev, target_metadata.st_ino) == (
+        temp_metadata.st_dev,
+        temp_metadata.st_ino,
+    )
+    assert str(root) not in repr(result)
+
+
+def test_write_file_fsync_failure_removes_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    tools_module = _tools_module()
+
+    def failing_fsync(descriptor: int) -> None:
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(tools_module.os, "fsync", failing_fsync)
+
+    result = _tools(root).write_file(path="note.txt", content="content")
+
+    assert result.ok is False
+    assert result.error_code == "WRITE_FAILED"
+    assert list(root.iterdir()) == []
+
+
 def test_write_file_rejects_non_string_and_oversized_utf8_content(
     tmp_path: Path,
 ) -> None:
@@ -328,6 +437,160 @@ def test_move_file_rolls_back_destination_when_source_unlink_fails(
     assert result.error_code == "MOVE_FAILED"
     assert source.read_text(encoding="utf-8") == "source"
     assert not destination.exists()
+
+
+def test_move_file_reports_destination_rollback_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    source = root / "source.txt"
+    destination = root / "destination.txt"
+    source.write_text("source", encoding="utf-8")
+    tools_module = _tools_module()
+
+    def failing_unlink(path, *args, **kwargs) -> None:
+        if Path(path) in {source, destination}:
+            raise OSError("simulated unlink failure")
+        raise AssertionError(f"unexpected unlink path: {path}")
+
+    monkeypatch.setattr(tools_module.os, "unlink", failing_unlink)
+
+    result = _tools(root).move_file(
+        source="source.txt",
+        destination="destination.txt",
+    )
+
+    assert result.ok is False
+    assert result.error_code == "MOVE_ROLLBACK_FAILED"
+    assert result.data == {
+        "source": "source.txt",
+        "destination": "destination.txt",
+        "source_exists": True,
+        "destination_exists": True,
+    }
+    assert source.read_text(encoding="utf-8") == "source"
+    assert destination.read_text(encoding="utf-8") == "source"
+    assert os.path.samefile(source, destination)
+    assert str(root) not in repr(result)
+
+
+def test_move_file_rollback_preserves_identity_mismatched_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    source = root / "source.txt"
+    destination = root / "destination.txt"
+    replacement = root / "replacement.txt"
+    source.write_text("source", encoding="utf-8")
+    replacement.write_text("replacement", encoding="utf-8")
+    source_identity = (os.stat(source).st_dev, os.stat(source).st_ino)
+    replacement_identity = (
+        os.stat(replacement).st_dev,
+        os.stat(replacement).st_ino,
+    )
+    tools_module = _tools_module()
+    original_unlink = tools_module.os.unlink
+
+    def replace_destination_then_fail(path, *args, **kwargs) -> None:
+        if Path(path) == source:
+            original_unlink(destination)
+            os.replace(replacement, destination)
+            raise OSError("simulated source unlink failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        tools_module.os,
+        "unlink",
+        replace_destination_then_fail,
+    )
+
+    result = _tools(root).move_file(
+        source="source.txt",
+        destination="destination.txt",
+    )
+
+    assert result.ok is False
+    assert result.error_code == "MOVE_ROLLBACK_FAILED"
+    assert result.data == {
+        "source": "source.txt",
+        "destination": "destination.txt",
+        "source_exists": True,
+        "destination_exists": True,
+    }
+    assert source.read_text(encoding="utf-8") == "source"
+    assert destination.read_text(encoding="utf-8") == "replacement"
+    assert (os.stat(source).st_dev, os.stat(source).st_ino) == source_identity
+    assert (
+        os.stat(destination).st_dev,
+        os.stat(destination).st_ino,
+    ) == replacement_identity
+
+
+def test_move_file_link_exdev_preserves_source_and_destination_absence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    source = root / "source.txt"
+    destination = root / "destination.txt"
+    source.write_text("source", encoding="utf-8")
+    tools_module = _tools_module()
+
+    def failing_link(source_path, destination_path, *args, **kwargs) -> None:
+        raise OSError(errno.EXDEV, "simulated cross-device link")
+
+    monkeypatch.setattr(tools_module.os, "link", failing_link)
+
+    result = _tools(root).move_file(
+        source="source.txt",
+        destination="destination.txt",
+    )
+
+    assert result.ok is False
+    assert result.error_code == "MOVE_FAILED"
+    assert source.read_text(encoding="utf-8") == "source"
+    assert not destination.exists()
+
+
+def test_move_file_preserves_file_metadata(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    source = root / "source.bin"
+    destination = root / "nested" / "destination.bin"
+    source.write_bytes(b"metadata")
+    os.chmod(source, 0o640)
+    os.utime(
+        source,
+        ns=(1_700_000_000_000_000_000, 1_700_000_001_000_000_000),
+    )
+    before = os.stat(source)
+
+    result = _tools(root).move_file(
+        source="source.bin",
+        destination="nested/destination.bin",
+    )
+
+    after = os.stat(destination)
+    assert result.ok
+    assert not source.exists()
+    assert (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+    ) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_size,
+        before.st_mtime_ns,
+    )
 
 
 def test_mutations_resolve_operands_immediately_before_each_operation(
@@ -815,6 +1078,67 @@ def test_execute_rejects_unknown_tool_non_dict_and_missing_arguments(
     assert non_dict.error_code == "INVALID_ARGUMENTS"
     assert missing.ok is False
     assert missing.error_code == "INVALID_ARGUMENTS"
+
+
+@pytest.mark.parametrize("name", [[], {}])
+def test_execute_rejects_malformed_tool_name(
+    tmp_path: Path,
+    name,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+
+    result = _tools(root).execute(name, {})
+
+    assert result.ok is False
+    assert result.error_code == "INVALID_TOOL_NAME"
+    assert result.data == {}
+
+
+def test_execute_sanitizes_unexpected_handler_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    tools = _tools(root)
+
+    def failing_write_file(**arguments):
+        raise RuntimeError(f"unexpected failure at {root}")
+
+    monkeypatch.setattr(tools, "write_file", failing_write_file)
+
+    result = tools.execute(
+        "write_file",
+        {"path": "note.txt", "content": "content"},
+    )
+
+    assert result.ok is False
+    assert result.error_code == "TOOL_EXECUTION_FAILED"
+    assert result.data == {}
+    assert str(root) not in result.summary
+    assert str(root) not in repr(result)
+    assert str(root) not in repr(result.model_payload())
+
+
+def test_execute_reraises_memory_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    tools = _tools(root)
+
+    def failing_write_file(**arguments):
+        raise MemoryError("simulated exhaustion")
+
+    monkeypatch.setattr(tools, "write_file", failing_write_file)
+
+    with pytest.raises(MemoryError, match="simulated exhaustion"):
+        tools.execute(
+            "write_file",
+            {"path": "note.txt", "content": "content"},
+        )
 
 
 def test_execute_converts_expected_errors_without_leaking_root(
