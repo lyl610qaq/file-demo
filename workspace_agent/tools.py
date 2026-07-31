@@ -27,6 +27,190 @@ _MAX_AMBIGUOUS_TEXT_CHARS = 8
 _CURSOR_VERSION = 1
 
 
+TOOL_SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List workspace directory entries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative directory path.",
+                        "default": ".",
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "Include entries in nested directories.",
+                        "default": False,
+                    },
+                    "cursor": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Authenticated continuation cursor.",
+                        "default": None,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum entries to return.",
+                        "minimum": 1,
+                        "maximum": 200,
+                        "default": 100,
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": "Search workspace files for text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Non-empty text to find.",
+                        "minLength": 1,
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative file or directory path.",
+                        "default": ".",
+                    },
+                    "cursor": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Authenticated continuation cursor.",
+                        "default": None,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum matches to return.",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 50,
+                    },
+                    "case_sensitive": {
+                        "type": "boolean",
+                        "description": "Match letter case exactly.",
+                        "default": True,
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a bounded text segment from a workspace file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative file path.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Byte offset at a character boundary.",
+                        "minimum": 0,
+                        "maximum": 2**63 - 1,
+                        "default": 0,
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum bytes to read.",
+                        "minimum": 1,
+                        "maximum": 2**31 - 1,
+                    },
+                    "cursor": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "description": "Authenticated continuation cursor.",
+                        "default": None,
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "stat_path",
+            "description": "Inspect a workspace file or directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative file or directory path.",
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Atomically write UTF-8 text to a workspace file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative destination file path.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Text to encode as UTF-8.",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "Atomically replace a safe existing file.",
+                        "default": False,
+                    },
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_file",
+            "description": "Move a workspace file without replacing a target.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Relative source file path.",
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "Relative destination file path.",
+                    },
+                },
+                "required": ["source", "destination"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
 class ToolInputError(ValueError):
     def __init__(
         self,
@@ -276,6 +460,54 @@ def _error_result(operation: str, error: Exception) -> ToolResult:
             f"{operation} failed: invalid input",
         )
     return _failure("READ_ERROR", f"{operation} failed: filesystem error")
+
+
+def _mutation_error_result(operation: str, error: Exception) -> ToolResult:
+    if isinstance(error, ToolInputError):
+        return _failure(
+            error.code,
+            f"{operation} failed: {error}",
+            error.data,
+        )
+    if isinstance(error, PathRejected):
+        return _failure("PATH_REJECTED", f"{operation} failed: path rejected")
+    if isinstance(error, FileNotFoundError):
+        return _failure("NOT_FOUND", f"{operation} failed: path not found")
+    if isinstance(error, PermissionError):
+        return _failure(
+            "ACCESS_DENIED",
+            f"{operation} failed: access denied",
+        )
+    if isinstance(error, (TypeError, ValueError)):
+        return _failure(
+            "INVALID_INPUT",
+            f"{operation} failed: invalid input",
+        )
+    code = "WRITE_FAILED" if operation == "write_file" else "MOVE_FAILED"
+    return _failure(code, f"{operation} failed: filesystem error")
+
+
+def _dispatch_error_result(name: str, error: Exception) -> ToolResult:
+    if isinstance(error, ToolInputError):
+        return _failure(
+            error.code,
+            f"{name} failed: invalid input",
+        )
+    if isinstance(error, PathRejected):
+        return _failure("PATH_REJECTED", f"{name} failed: path rejected")
+    if isinstance(error, FileNotFoundError):
+        return _failure("NOT_FOUND", f"{name} failed: path not found")
+    if isinstance(error, PermissionError):
+        return _failure("ACCESS_DENIED", f"{name} failed: access denied")
+    if isinstance(error, (TypeError, ValueError)):
+        return _failure(
+            "INVALID_ARGUMENTS",
+            f"{name} failed: invalid arguments",
+        )
+    return _failure(
+        "TOOL_EXECUTION_FAILED",
+        f"{name} failed: filesystem error",
+    )
 
 
 class WorkspaceTools:
@@ -796,6 +1028,412 @@ class WorkspaceTools:
             )
         except Exception as error:
             return _error_result("stat_path", error)
+
+    def write_file(
+        self,
+        *,
+        path: str,
+        content: str,
+        overwrite: bool = False,
+    ) -> ToolResult:
+        temp_relative: str | None = None
+        temp_identity: tuple[int, int] | None = None
+        descriptor: int | None = None
+        try:
+            if not isinstance(content, str):
+                raise ToolInputError("content must be a string")
+            if not isinstance(overwrite, bool):
+                raise ToolInputError("overwrite must be a boolean")
+            payload = content.encode("utf-8")
+            if len(payload) > self.max_write_bytes:
+                raise ToolInputError(
+                    "content exceeds the write byte limit",
+                    "WRITE_TOO_LARGE",
+                )
+
+            relative_path, parent_relative = self._prepare_target(path)
+            target, target_metadata = self._target_state(relative_path)
+            if target_metadata is not None:
+                if not overwrite:
+                    raise ToolInputError(
+                        "target already exists",
+                        "TARGET_EXISTS",
+                    )
+                if not stat.S_ISREG(target_metadata.st_mode):
+                    raise ToolInputError(
+                        "existing target must be a regular file",
+                        "INVALID_TARGET",
+                    )
+
+            (
+                temp_relative,
+                descriptor,
+                temp_identity,
+            ) = self._create_temp_file(parent_relative, target.name)
+            with os.fdopen(descriptor, "wb", closefd=True) as handle:
+                descriptor = None
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            temp = self._resolve_owned_file(
+                temp_relative,
+                temp_identity,
+            )
+            self._validate_directory(parent_relative)
+            target, target_metadata = self._target_state(relative_path)
+            if overwrite:
+                if (
+                    target_metadata is not None
+                    and not stat.S_ISREG(target_metadata.st_mode)
+                ):
+                    raise ToolInputError(
+                        "existing target must be a regular file",
+                        "INVALID_TARGET",
+                    )
+                os.replace(temp, target)
+                temp_relative = None
+            else:
+                if target_metadata is not None:
+                    raise ToolInputError(
+                        "target already exists",
+                        "TARGET_EXISTS",
+                    )
+                try:
+                    os.link(temp, target)
+                except FileExistsError as error:
+                    raise ToolInputError(
+                        "target already exists",
+                        "TARGET_EXISTS",
+                    ) from error
+
+            return _success(
+                {
+                    "path": relative_path,
+                    "bytes": len(payload),
+                },
+                f"Wrote {len(payload)} bytes to {relative_path}",
+            )
+        except (
+            FileNotFoundError,
+            PathRejected,
+            ToolInputError,
+            TypeError,
+            ValueError,
+            OSError,
+        ) as error:
+            return _mutation_error_result("write_file", error)
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temp_relative is not None and temp_identity is not None:
+                self._cleanup_owned_file(temp_relative, temp_identity)
+
+    def move_file(
+        self,
+        *,
+        source: str,
+        destination: str,
+    ) -> ToolResult:
+        destination_created = False
+        source_identity: tuple[int, int] | None = None
+        source_relative: str | None = None
+        destination_relative: str | None = None
+        try:
+            source_path, source_metadata = self._resolve_regular_file(source)
+            source_relative = _relative(self.guard.root, source_path)
+            source_identity = (
+                source_metadata.st_dev,
+                source_metadata.st_ino,
+            )
+            destination_relative, parent_relative = self._prepare_target(
+                destination
+            )
+
+            self._validate_directory(parent_relative)
+            source_path, source_metadata = self._resolve_regular_file(
+                source_relative
+            )
+            if (
+                source_metadata.st_dev,
+                source_metadata.st_ino,
+            ) != source_identity:
+                raise ToolInputError(
+                    "source changed before move",
+                    "MOVE_FAILED",
+                )
+            destination_path, destination_metadata = self._target_state(
+                destination_relative
+            )
+            if destination_metadata is not None:
+                raise ToolInputError(
+                    "target already exists",
+                    "TARGET_EXISTS",
+                )
+
+            try:
+                os.link(source_path, destination_path)
+            except FileExistsError as error:
+                raise ToolInputError(
+                    "target already exists",
+                    "TARGET_EXISTS",
+                ) from error
+            destination_created = True
+
+            try:
+                source_path, source_metadata = self._resolve_regular_file(
+                    source_relative
+                )
+                if (
+                    source_metadata.st_dev,
+                    source_metadata.st_ino,
+                ) != source_identity:
+                    raise OSError("source changed before removal")
+                os.unlink(source_path)
+            except (
+                FileNotFoundError,
+                PathRejected,
+                ToolInputError,
+                TypeError,
+                ValueError,
+                OSError,
+            ):
+                self._rollback_move(destination_relative, source_identity)
+                destination_created = False
+                return _failure(
+                    "MOVE_FAILED",
+                    "move_file failed: source could not be removed",
+                )
+
+            destination_created = False
+            return _success(
+                {
+                    "source": source_relative,
+                    "destination": destination_relative,
+                },
+                f"Moved {source_relative} to {destination_relative}",
+            )
+        except (
+            FileNotFoundError,
+            PathRejected,
+            ToolInputError,
+            TypeError,
+            ValueError,
+            OSError,
+        ) as error:
+            if (
+                destination_created
+                and destination_relative is not None
+                and source_identity is not None
+            ):
+                self._rollback_move(
+                    destination_relative,
+                    source_identity,
+                )
+            return _mutation_error_result("move_file", error)
+
+    def execute(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        handlers: dict[str, Callable[..., ToolResult]] = {
+            "list_dir": self.list_dir,
+            "search_files": self.search_files,
+            "read_file": self.read_file,
+            "stat_path": self.stat_path,
+            "write_file": self.write_file,
+            "move_file": self.move_file,
+        }
+        if not isinstance(arguments, dict):
+            return _failure(
+                "INVALID_ARGUMENTS",
+                "tool execution failed: arguments must be an object",
+            )
+        handler = handlers.get(name)
+        if handler is None:
+            return _failure(
+                "UNKNOWN_TOOL",
+                "tool execution failed: unknown tool",
+            )
+        try:
+            return handler(**arguments)
+        except (
+            FileNotFoundError,
+            PathRejected,
+            ToolInputError,
+            TypeError,
+            ValueError,
+            OSError,
+        ) as error:
+            return _dispatch_error_result(name, error)
+
+    def _prepare_target(self, relative_path: str) -> tuple[str, str]:
+        resolved = self.guard.resolve(relative_path, must_exist=False)
+        normalized = _relative(self.guard.root, resolved)
+        if normalized == ".":
+            raise ToolInputError(
+                "target must name a file",
+                "INVALID_TARGET",
+            )
+
+        components = normalized.split("/")
+        parent_relative = "."
+        for component in components[:-1]:
+            self._validate_directory(parent_relative)
+            child_relative = (
+                component
+                if parent_relative == "."
+                else f"{parent_relative}/{component}"
+            )
+            child, child_metadata = self._optional_lstat(child_relative)
+            if child_metadata is None:
+                child = self.guard.resolve(
+                    child_relative,
+                    must_exist=False,
+                )
+                try:
+                    os.mkdir(child)
+                except FileExistsError:
+                    pass
+                child, child_metadata = self._lstat(child_relative)
+            if (
+                _is_link_or_reparse(child_metadata)
+                or not stat.S_ISDIR(child_metadata.st_mode)
+            ):
+                raise PathRejected(
+                    "target parent is not a physical directory"
+                )
+            parent_relative = child_relative
+
+        self._validate_directory(parent_relative)
+        self._target_state(normalized)
+        return normalized, parent_relative
+
+    def _optional_lstat(
+        self,
+        relative_path: str,
+    ) -> tuple[Path, os.stat_result | None]:
+        resolved = self.guard.resolve(relative_path, must_exist=False)
+        try:
+            return resolved, os.lstat(resolved)
+        except FileNotFoundError:
+            return resolved, None
+
+    def _target_state(
+        self,
+        relative_path: str,
+    ) -> tuple[Path, os.stat_result | None]:
+        resolved, metadata = self._optional_lstat(relative_path)
+        if metadata is not None and _is_link_or_reparse(metadata):
+            raise PathRejected("path contains a non-physical component")
+        return resolved, metadata
+
+    def _validate_directory(self, relative_path: str) -> Path:
+        resolved, metadata = self._lstat(relative_path)
+        if (
+            _is_link_or_reparse(metadata)
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise PathRejected("path is not a physical directory")
+        return resolved
+
+    def _create_temp_file(
+        self,
+        parent_relative: str,
+        target_name: str,
+    ) -> tuple[str, int, tuple[int, int]]:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_BINARY", 0)
+        for _ in range(128):
+            temp_name = f".{target_name}.{secrets.token_hex(16)}.tmp"
+            temp_relative = (
+                temp_name
+                if parent_relative == "."
+                else f"{parent_relative}/{temp_name}"
+            )
+            temp = self.guard.resolve(temp_relative, must_exist=False)
+            try:
+                descriptor = os.open(temp, flags, 0o600)
+            except FileExistsError:
+                continue
+            metadata = os.fstat(descriptor)
+            return (
+                temp_relative,
+                descriptor,
+                (metadata.st_dev, metadata.st_ino),
+            )
+        raise OSError("could not allocate temporary file")
+
+    def _resolve_owned_file(
+        self,
+        relative_path: str,
+        identity: tuple[int, int],
+    ) -> Path:
+        resolved, metadata = self._resolve_regular_file(relative_path)
+        if (metadata.st_dev, metadata.st_ino) != identity:
+            raise PathRejected("temporary file changed")
+        return resolved
+
+    def _cleanup_owned_file(
+        self,
+        relative_path: str,
+        identity: tuple[int, int],
+    ) -> None:
+        try:
+            resolved, metadata = self._optional_lstat(relative_path)
+            if metadata is None:
+                return
+            if (
+                _is_link_or_reparse(metadata)
+                or not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino) != identity
+            ):
+                return
+            resolved = self.guard.resolve(relative_path, must_exist=True)
+            os.unlink(resolved)
+        except (
+            FileNotFoundError,
+            PathRejected,
+            ToolInputError,
+            TypeError,
+            ValueError,
+            OSError,
+        ):
+            return
+
+    def _rollback_move(
+        self,
+        destination: str,
+        source_identity: tuple[int, int],
+    ) -> None:
+        try:
+            destination_path, metadata = self._optional_lstat(destination)
+            if metadata is None:
+                return
+            if (
+                _is_link_or_reparse(metadata)
+                or not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino) != source_identity
+            ):
+                return
+            destination_path = self.guard.resolve(
+                destination,
+                must_exist=True,
+            )
+            os.unlink(destination_path)
+        except (
+            FileNotFoundError,
+            PathRejected,
+            ToolInputError,
+            TypeError,
+            ValueError,
+            OSError,
+        ):
+            return
 
     def _resolve_regular_file(
         self,
