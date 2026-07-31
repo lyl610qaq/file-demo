@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>工作区智能体</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand" aria-label="工作区智能体">
+      <span class="brand-mark" aria-hidden="true">工</span>
+      <div class="brand-copy">
+        <strong>工作区智能体</strong>
+        <span id="model-status" class="model-status">正在连接模型</span>
+      </div>
+    </div>
+    <div class="usage" aria-label="模型用量">
+      <span>调用 <b id="usage-calls">0</b></span>
+      <span>Token <b id="usage-total">0</b></span>
+      <a
+        id="trace-download"
+        class="icon-button is-disabled"
+        href="#"
+        download
+        title="下载运行轨迹"
+        aria-label="下载运行轨迹"
+        aria-disabled="true"
+      >
+        <i data-lucide="download" aria-hidden="true"></i>
+        <span class="icon-fallback" aria-hidden="true">下载</span>
+      </a>
+    </div>
+  </header>
+
+  <nav class="mobile-tabs" aria-label="工作台视图">
+    <button type="button" data-view="files" aria-controls="files-pane">文件</button>
+    <button type="button" class="active" data-view="task" aria-controls="task-pane">任务</button>
+    <button type="button" data-view="trace" aria-controls="trace-pane">轨迹</button>
+  </nav>
+
+  <main class="workspace-grid">
+    <aside id="files-pane" class="pane files-pane" data-pane="files" aria-labelledby="files-heading">
+      <div class="pane-header">
+        <div>
+          <h2 id="files-heading">工作区文件</h2>
+          <span id="tree-summary" class="pane-caption">正在读取</span>
+        </div>
+        <div class="toolbar" aria-label="文件操作">
+          <button
+            id="refresh-button"
+            class="icon-button"
+            type="button"
+            title="刷新文件"
+            aria-label="刷新文件"
+          >
+            <i data-lucide="refresh-cw" aria-hidden="true"></i>
+            <span class="icon-fallback" aria-hidden="true">刷新</span>
+          </button>
+          <button
+            id="reset-button"
+            class="icon-button danger"
+            type="button"
+            title="重置工作区"
+            aria-label="重置工作区"
+          >
+            <i data-lucide="rotate-ccw" aria-hidden="true"></i>
+            <span class="icon-fallback" aria-hidden="true">重置</span>
+          </button>
+        </div>
+      </div>
+      <div id="tree-status" class="inline-state" role="status"></div>
+      <div id="file-tree" class="file-tree" role="tree" aria-label="工作区文件"></div>
+      <button id="tree-load-more" class="load-more" type="button" hidden>继续加载文件</button>
+    </aside>
+
+    <section id="task-pane" class="pane task-pane active" data-pane="task" aria-labelledby="task-heading">
+      <form id="task-form" class="task-form">
+        <div class="form-heading">
+          <div>
+            <h1 id="task-heading">任务</h1>
+            <span id="run-status" class="status" data-state="idle" role="status" aria-live="polite">就绪</span>
+          </div>
+          <button id="run-button" type="submit" class="primary-button">
+            <i data-lucide="play" aria-hidden="true"></i>
+            <span>运行</span>
+          </button>
+        </div>
+        <label for="task-input">任务内容</label>
+        <textarea
+          id="task-input"
+          name="task"
+          rows="5"
+          maxlength="4000"
+          placeholder="输入需要智能体在工作区完成的任务"
+          required
+        ></textarea>
+      </form>
+
+      <section class="content-band" aria-labelledby="reply-heading">
+        <div class="band-heading">
+          <h2 id="reply-heading">智能体回复</h2>
+          <span id="reply-state" class="pane-caption"></span>
+        </div>
+        <pre id="assistant-output" class="assistant-output" aria-live="polite">等待任务</pre>
+      </section>
+
+      <section class="content-band viewer-band" aria-labelledby="viewer-path">
+        <div class="band-heading">
+          <h2 id="viewer-path">文件预览</h2>
+          <span id="viewer-meta" class="pane-caption"></span>
+        </div>
+        <pre id="file-content" tabindex="0">从左侧选择文件</pre>
+      </section>
+    </section>
+
+    <aside id="trace-pane" class="pane trace-pane" data-pane="trace" aria-labelledby="trace-heading">
+      <div class="pane-header">
+        <div>
+          <h2 id="trace-heading">运行轨迹</h2>
+          <span class="pane-caption">按发生顺序</span>
+        </div>
+        <span id="step-count" class="step-count" aria-label="轨迹数量">0</span>
+      </div>
+      <ol id="trace-list" class="trace-list" aria-live="polite"></ol>
+      <p id="trace-empty" class="empty-state">运行任务后显示步骤</p>
+    </aside>
+  </main>
+
+  <dialog id="reset-dialog" aria-labelledby="reset-title">
+    <form method="dialog">
+      <h2 id="reset-title">重置工作区</h2>
+      <p>当前文件变更将恢复为初始演示状态。</p>
+      <div class="dialog-actions">
+        <button type="button" id="cancel-reset" class="secondary-button">取消</button>
+        <button type="button" id="confirm-reset" class="danger-button">确认重置</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

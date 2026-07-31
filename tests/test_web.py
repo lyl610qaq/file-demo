@@ -1784,6 +1784,97 @@ async def test_trusted_proxy_clients_receive_independent_reset_limits(
     assert second.status_code == 200
 
 
+def test_frontend_shell_exposes_three_pane_agent_controls(
+    tmp_path: Path,
+) -> None:
+    static_root = Path("static").resolve()
+    assert static_root.joinpath("index.html").is_file()
+    settings = settings_for(tmp_path, static_root=static_root)
+    app = create_app(settings, model=FinalOnlyModel())
+
+    with TestClient(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    html = response.text
+    for control_id in (
+        "model-status",
+        "usage-calls",
+        "usage-total",
+        "trace-download",
+        "file-tree",
+        "refresh-button",
+        "reset-button",
+        "task-form",
+        "task-input",
+        "run-button",
+        "run-status",
+        "assistant-output",
+        "file-content",
+        "trace-list",
+        "reset-dialog",
+    ):
+        assert f'id="{control_id}"' in html
+    assert 'data-pane="files"' in html
+    assert 'data-pane="task"' in html
+    assert 'data-pane="trace"' in html
+    assert 'aria-live="polite"' in html
+    assert 'lang="zh-CN"' in html
+
+
+def test_frontend_assets_are_served_and_use_safe_browser_primitives(
+    tmp_path: Path,
+) -> None:
+    static_root = Path("static").resolve()
+    settings = settings_for(tmp_path, static_root=static_root)
+    app = create_app(settings, model=FinalOnlyModel())
+
+    with TestClient(app) as client:
+        script_response = client.get("/assets/app.js")
+        style_response = client.get("/assets/styles.css")
+
+    assert script_response.status_code == 200
+    assert style_response.status_code == 200
+    script = script_response.text
+    assert "textContent" in script
+    assert "innerHTML" not in script
+    assert "URLSearchParams" in script
+    assert 'location.protocol === "https:" ? "wss:" : "ws:"' in script
+    assert "new WebSocket" in script
+    assert '"/api/meta"' in script
+    assert '"/api/tree"' in script
+    assert '"/api/file"' in script
+    assert '"/api/reset"' in script
+    assert "has_more" in script
+    assert "next_cursor" in script
+    for event_type in (
+        "run_started",
+        "model_call_started",
+        "usage_updated",
+        "tool_started",
+        "tool_finished",
+        "assistant_message",
+        "run_completed",
+        "run_failed",
+    ):
+        assert f'"{event_type}"' in script
+
+
+def test_frontend_styles_define_dense_responsive_and_reduced_motion_views() -> (
+    None
+):
+    styles = Path("static/styles.css").read_text(encoding="utf-8")
+
+    assert "grid-template-columns:" in styles
+    assert "@media (max-width: 860px)" in styles
+    assert "@media (prefers-reduced-motion: reduce)" in styles
+    assert ".mobile-tabs" in styles
+    assert "[data-pane]" in styles
+    assert "letter-spacing: 0" in styles
+    assert "border-radius: 8px" in styles or "border-radius: 6px" in styles
+    assert "gradient" not in styles.lower()
+
+
 def test_sliding_window_limiter_expires_isolates_keys_and_bounds_memory() -> None:
     now = [100.0]
     limiter = SlidingWindowLimiter(
