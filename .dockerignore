@@ -1,0 +1,17 @@
+.git
+.pytest_cache
+.ruff_cache
+__pycache__
+*.py[cod]
+*.egg-info
+.venv
+venv
+.env
+workspace
+traces
+.workspace-reset-*
+playwright-report
+test-results
+coverage
+node_modules
+tests

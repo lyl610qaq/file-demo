@@ -14,7 +14,11 @@ venv/
 # Generated application data
 workspace/
 traces/
+.workspace-reset-*
 
 # Browser test artifacts
 playwright-report/
 test-results/
+coverage/
+.nyc_output/
+node_modules/
