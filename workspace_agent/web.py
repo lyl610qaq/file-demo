@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import shutil
@@ -12,6 +13,7 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 from fastapi import (
     FastAPI,
@@ -33,8 +35,14 @@ from workspace_agent.trace import TraceStore
 
 
 _TASK_LIMIT = 4000
+_MAX_RUN_FRAME_CHARS = 8192
 _INITIAL_MESSAGE_TIMEOUT_SECONDS = 15.0
 _DEFAULT_LIMITER_KEYS = 1024
+_ORIGIN_ERROR = "allowed_origin must be a valid HTTP origin"
+
+
+class _InvalidRunRequest(ValueError):
+    pass
 
 
 class SlidingWindowLimiter:
@@ -126,6 +134,65 @@ class _CapacityGate:
             self._active -= 1
 
 
+def _normalize_http_origin(value: object) -> tuple[str, str, int]:
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(character.isspace() for character in value)
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError(_ORIGIN_ERROR)
+    try:
+        parsed = urlsplit(value)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        raise ValueError(_ORIGIN_ERROR) from None
+
+    if (
+        scheme not in {"http", "https"}
+        or not parsed.netloc
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(_ORIGIN_ERROR)
+
+    try:
+        normalized_host = _normalize_origin_host(hostname)
+    except (UnicodeError, ValueError):
+        raise ValueError(_ORIGIN_ERROR) from None
+    effective_port = port if port is not None else (80 if scheme == "http" else 443)
+    return scheme, normalized_host, effective_port
+
+
+def _normalize_origin_host(hostname: str) -> str:
+    if ":" in hostname:
+        address = ipaddress.ip_address(hostname)
+        if address.version != 6:
+            raise ValueError("invalid origin host")
+        return address.compressed
+
+    normalized = hostname.encode("idna").decode("ascii").lower()
+    if len(normalized) > 253:
+        raise ValueError("invalid origin host")
+    labels = normalized.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or label.startswith("-")
+        or label.endswith("-")
+        or not all(character.isalnum() or character == "-" for character in label)
+        for label in labels
+    ):
+        raise ValueError("invalid origin host")
+    return normalized
+
+
 def _is_link_or_reparse(metadata: os.stat_result) -> bool:
     file_attributes = getattr(metadata, "st_file_attributes", 0)
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
@@ -204,6 +271,26 @@ def _reset_workspace(settings: Settings) -> None:
     _copy_seed_directory(seed_guard, workspace_guard)
 
 
+async def _run_reset_worker(settings: Settings) -> None:
+    worker = asyncio.create_task(
+        asyncio.to_thread(_reset_workspace, settings)
+    )
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if worker.done() and not worker.cancelled():
+            with suppress(BaseException):
+                worker.result()
+        raise
+
+
 def _tool_status(error_code: str | None) -> int:
     if error_code == "NOT_FOUND":
         return 404
@@ -242,6 +329,62 @@ async def _send_failure(
         await socket.close(code=close_code)
 
 
+def _reject_json_constant(value: str) -> None:
+    raise _InvalidRunRequest("non-finite JSON value")
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise _InvalidRunRequest("duplicate JSON field")
+        value[key] = item
+    return value
+
+
+def _parse_run_request(payload: str) -> str:
+    if len(payload) > _MAX_RUN_FRAME_CHARS:
+        raise _InvalidRunRequest("run frame is too large")
+    try:
+        request = json.loads(
+            payload,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_unique_json_object,
+        )
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+        raise _InvalidRunRequest("invalid JSON") from None
+    if not isinstance(request, dict) or set(request) != {"type", "task"}:
+        raise _InvalidRunRequest("invalid run object")
+    task = request["task"]
+    if (
+        request["type"] != "run"
+        or not isinstance(task, str)
+        or not task.strip()
+        or len(task) > _TASK_LIMIT
+    ):
+        raise _InvalidRunRequest("invalid run fields")
+    return task.strip()
+
+
+async def _receive_run_task(socket: WebSocket) -> str:
+    frame = await asyncio.wait_for(
+        socket.receive(),
+        timeout=_INITIAL_MESSAGE_TIMEOUT_SECONDS,
+    )
+    if frame.get("type") == "websocket.disconnect":
+        raise WebSocketDisconnect(
+            code=frame.get("code", 1000),
+            reason=frame.get("reason", ""),
+        )
+    payload = frame.get("text")
+    if frame.get("type") != "websocket.receive" or not isinstance(
+        payload,
+        str,
+    ):
+        raise _InvalidRunRequest("first frame must be text")
+    return _parse_run_request(payload)
+
+
 async def _watch_client(socket: WebSocket) -> str:
     try:
         message = await socket.receive()
@@ -260,33 +403,44 @@ async def _run_with_disconnect_monitor(
     async def send_event(event: dict[str, Any]) -> None:
         await socket.send_json(event)
 
-    runner_task = asyncio.create_task(runner.run(task, send_event))
     client_task = asyncio.create_task(_watch_client(socket))
+    await asyncio.sleep(0)
+    if client_task.done():
+        client_state = await client_task
+        if client_state == "extra-message":
+            await _send_failure(
+                socket,
+                "Invalid run request",
+                close_code=1008,
+            )
+        return
+
+    runner_task = asyncio.create_task(runner.run(task, send_event))
     done, _ = await asyncio.wait(
         {runner_task, client_task},
         return_when=asyncio.FIRST_COMPLETED,
     )
 
-    if runner_task in done:
-        client_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await client_task
-        try:
+    if client_task in done:
+        client_state = await client_task
+        runner_task.cancel()
+        with suppress(asyncio.CancelledError, RuntimeError, WebSocketDisconnect):
             await runner_task
-        except (RuntimeError, WebSocketDisconnect):
-            return
+        if client_state == "extra-message":
+            await _send_failure(
+                socket,
+                "Invalid run request",
+                close_code=1008,
+            )
         return
 
-    client_state = await client_task
-    runner_task.cancel()
-    with suppress(asyncio.CancelledError, RuntimeError, WebSocketDisconnect):
+    client_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await client_task
+    try:
         await runner_task
-    if client_state == "extra-message":
-        await _send_failure(
-            socket,
-            "Only one run request is allowed",
-            close_code=1008,
-        )
+    except (RuntimeError, WebSocketDisconnect):
+        return
 
 
 def create_app(
@@ -294,6 +448,7 @@ def create_app(
     model: Any | None = None,
 ) -> FastAPI:
     configured = settings or Settings()
+    allowed_origin = _normalize_http_origin(configured.allowed_origin)
     configured.workspace_root.mkdir(parents=True, exist_ok=True)
     configured.seed_root.mkdir(parents=True, exist_ok=True)
     configured.trace_root.mkdir(parents=True, exist_ok=True)
@@ -337,6 +492,7 @@ def create_app(
     app.state.tools = tools
     app.state.traces = traces
     app.state.model = selected_model
+    app.state.allowed_origin = allowed_origin
     app.state.workspace_lock = _CapacityGate(1)
     app.state.run_slots = _CapacityGate(configured.max_concurrent_runs)
     app.state.connection_slots = _CapacityGate(
@@ -429,7 +585,7 @@ def create_app(
             )
         try:
             try:
-                await asyncio.to_thread(_reset_workspace, configured)
+                await _run_reset_worker(configured)
             except Exception:
                 raise HTTPException(
                     status_code=500,
@@ -470,8 +626,12 @@ def create_app(
 
     @app.websocket("/ws/agent")
     async def agent_socket(socket: WebSocket) -> None:
-        origin = socket.headers.get("origin")
-        if configured.allowed_origin and origin != configured.allowed_origin:
+        try:
+            request_origin = _normalize_http_origin(socket.headers.get("origin"))
+        except ValueError:
+            await socket.close(code=1008, reason="origin rejected")
+            return
+        if request_origin != app.state.allowed_origin:
             await socket.close(code=1008, reason="origin rejected")
             return
 
@@ -490,13 +650,10 @@ def create_app(
             await socket.accept()
             accepted = True
             try:
-                request = await asyncio.wait_for(
-                    socket.receive_json(),
-                    timeout=_INITIAL_MESSAGE_TIMEOUT_SECONDS,
-                )
+                task = await _receive_run_task(socket)
             except WebSocketDisconnect:
                 return
-            except (asyncio.TimeoutError, json.JSONDecodeError, RuntimeError):
+            except (asyncio.TimeoutError, _InvalidRunRequest, RuntimeError):
                 await _send_failure(
                     socket,
                     "Invalid run request",
@@ -504,23 +661,6 @@ def create_app(
                 )
                 return
 
-            task = (
-                request.get("task")
-                if isinstance(request, dict)
-                and request.get("type") == "run"
-                else None
-            )
-            if (
-                not isinstance(task, str)
-                or not task.strip()
-                or len(task) > _TASK_LIMIT
-            ):
-                await _send_failure(
-                    socket,
-                    "Invalid run request",
-                    close_code=1008,
-                )
-                return
             if app.state.model is None:
                 await _send_failure(
                     socket,
@@ -551,7 +691,7 @@ def create_app(
                 traces=app.state.traces,
                 max_model_calls=configured.max_model_calls,
             )
-            await _run_with_disconnect_monitor(socket, runner, task.strip())
+            await _run_with_disconnect_monitor(socket, runner, task)
         except WebSocketDisconnect:
             return
         except Exception:

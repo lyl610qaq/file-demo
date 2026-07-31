@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -255,6 +256,96 @@ def test_websocket_rejects_wrong_origin_before_accept(tmp_path: Path) -> None:
     assert rejected.value.code == 1008
 
 
+@pytest.mark.parametrize("allowed_origin", ["", " ", "\t\r\n"])
+def test_create_app_rejects_blank_allowed_origin(
+    tmp_path: Path,
+    allowed_origin: str,
+) -> None:
+    settings = settings_for(tmp_path, allowed_origin=allowed_origin)
+
+    with pytest.raises(ValueError) as rejected:
+        create_app(settings, model=FinalOnlyModel())
+
+    assert str(rejected.value) == "allowed_origin must be a valid HTTP origin"
+
+
+@pytest.mark.parametrize(
+    "allowed_origin",
+    [
+        "ftp://testserver",
+        "http://user:configuration-secret@testserver",
+        "http://testserver/path",
+        "http://testserver?query=secret",
+        "http://testserver#fragment-secret",
+        "http://testserver:not-a-port",
+        "http://",
+        "not-an-origin",
+    ],
+)
+def test_create_app_rejects_malformed_allowed_origin_without_leaking_it(
+    tmp_path: Path,
+    allowed_origin: str,
+) -> None:
+    settings = settings_for(tmp_path, allowed_origin=allowed_origin)
+
+    with pytest.raises(ValueError) as rejected:
+        create_app(settings, model=FinalOnlyModel())
+
+    assert str(rejected.value) == "allowed_origin must be a valid HTTP origin"
+    assert "configuration-secret" not in str(rejected.value)
+    assert "fragment-secret" not in str(rejected.value)
+
+
+def test_websocket_compares_normalized_origin_components(tmp_path: Path) -> None:
+    app = create_app(
+        settings_for(tmp_path, allowed_origin="HTTP://TESTSERVER:80"),
+        model=FinalOnlyModel(),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws/agent",
+            headers={"origin": "http://testserver"},
+        ) as socket:
+            socket.send_json({"type": "run", "task": "Inspect files"})
+            events = receive_until_terminal(socket)
+
+    assert events[-1]["type"] == "run_completed"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        None,
+        "null",
+        "ws://testserver",
+        "http://testserver.evil",
+        "http://user:test@testserver",
+        "http://testserver/path",
+        "http://testserver?query=x",
+        "http://testserver#fragment",
+        "http://testserver:81",
+        "not-an-origin",
+    ],
+)
+def test_websocket_rejects_missing_malformed_and_cross_origins(
+    tmp_path: Path,
+    origin: str | None,
+) -> None:
+    app = create_app(settings_for(tmp_path), model=FinalOnlyModel())
+    headers = {} if origin is None else {"origin": origin}
+
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            with client.websocket_connect(
+                "/ws/agent",
+                headers=headers,
+            ):
+                pass
+
+    assert rejected.value.code == 1008
+
+
 def test_websocket_rate_limit_is_enforced_before_accept(tmp_path: Path) -> None:
     app = create_app(
         settings_for(tmp_path, rate_limit_per_minute=1),
@@ -281,6 +372,8 @@ def test_websocket_rate_limit_is_enforced_before_accept(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "message",
     [
+        {"type": "run"},
+        {"task": "valid task"},
         {"type": "run", "task": ""},
         {"type": "run", "task": " "},
         {"type": "run", "task": "x" * 4001},
@@ -323,6 +416,112 @@ def test_websocket_rejects_malformed_json(tmp_path: Path) -> None:
 
     assert event == {"type": "run_failed", "message": "Invalid run request"}
     assert closed.value.code == 1008
+
+
+@pytest.mark.parametrize(
+    ("frame_type", "payload"),
+    [
+        ("binary", b'{"type":"run","task":"binary-secret"}'),
+        ("text", '"scalar-secret"'),
+        ("text", '["list-secret"]'),
+        ("text", '{"type":"run","task":"Inspect","extra":"extra-secret"}'),
+        ("text", '{"type":"run","task":NaN}'),
+    ],
+)
+def test_websocket_first_frame_accepts_only_strict_text_json_object(
+    tmp_path: Path,
+    frame_type: str,
+    payload: str | bytes,
+) -> None:
+    app = create_app(settings_for(tmp_path), model=FinalOnlyModel())
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws/agent",
+            headers={"origin": "http://testserver"},
+        ) as socket:
+            if frame_type == "binary":
+                assert isinstance(payload, bytes)
+                socket.send_bytes(payload)
+            else:
+                assert isinstance(payload, str)
+                socket.send_text(payload)
+            event = socket.receive_json()
+            with pytest.raises(WebSocketDisconnect) as closed:
+                socket.receive_json()
+
+    assert event == {"type": "run_failed", "message": "Invalid run request"}
+    assert closed.value.code == 1008
+    serialized = json.dumps(event)
+    assert "secret" not in serialized
+    assert "NaN" not in serialized
+
+
+def test_websocket_rejects_every_frame_after_the_run_request(
+    tmp_path: Path,
+) -> None:
+    model = BlockingModel()
+    app = create_app(settings_for(tmp_path), model=model)
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws/agent",
+            headers={"origin": "http://testserver"},
+        ) as socket:
+            socket.send_json({"type": "run", "task": "Inspect files"})
+            assert socket.receive_json()["type"] == "run_started"
+            assert socket.receive_json()["type"] == "model_call_started"
+            assert model.started.wait(2)
+            socket.send_bytes(b"second-frame-secret")
+            event = socket.receive_json()
+            model.release.set()
+            with pytest.raises(WebSocketDisconnect) as closed:
+                socket.receive_json()
+
+    assert event == {"type": "run_failed", "message": "Invalid run request"}
+    assert closed.value.code == 1008
+    assert "second-frame-secret" not in json.dumps(event)
+
+
+@pytest.mark.asyncio
+async def test_queued_extra_frame_is_rejected_before_runner_starts() -> None:
+    from workspace_agent import web
+
+    class ExtraFrameSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+            self.close_code: int | None = None
+
+        async def receive(self) -> dict[str, Any]:
+            return {
+                "type": "websocket.receive",
+                "text": "unexpected-second-frame-secret",
+            }
+
+        async def send_json(self, event: dict[str, Any]) -> None:
+            self.sent.append(event)
+
+        async def close(self, code: int) -> None:
+            self.close_code = code
+
+    class NeverStartedRunner:
+        def __init__(self) -> None:
+            self.called = False
+
+        async def run(self, task: str, sink) -> None:
+            self.called = True
+
+    socket = ExtraFrameSocket()
+    runner = NeverStartedRunner()
+
+    await web._run_with_disconnect_monitor(socket, runner, "Inspect")
+
+    assert runner.called is False
+    assert socket.sent == [
+        {"type": "run_failed", "message": "Invalid run request"}
+    ]
+    assert socket.close_code == 1008
+    assert "unexpected-second-frame-secret" not in json.dumps(socket.sent)
 
 
 def test_websocket_reports_missing_model_without_secrets(tmp_path: Path) -> None:
@@ -535,6 +734,66 @@ def test_reset_failure_is_stable_and_does_not_leak_paths(
         }
     }
     assert secret not in response.text
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reset_settles_worker_before_releasing_workspace_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    worker_started = threading.Event()
+    worker_release = threading.Event()
+    worker_done = threading.Event()
+    order: list[str] = []
+
+    def blocking_reset(settings: Settings) -> None:
+        worker_started.set()
+        try:
+            worker_release.wait()
+        finally:
+            order.append("worker_done")
+            worker_done.set()
+
+    monkeypatch.setattr(web, "_reset_workspace", blocking_reset)
+    app = create_app(settings_for(tmp_path), model=FinalOnlyModel())
+    original_release = app.state.workspace_lock.release
+
+    def tracked_lock_release() -> None:
+        order.append("lock_release")
+        original_release()
+
+    app.state.workspace_lock.release = tracked_lock_release
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+    ) as client:
+        reset_task = asyncio.create_task(client.post("/api/reset"))
+        assert await asyncio.to_thread(worker_started.wait, 2)
+
+        reset_task.cancel()
+        await asyncio.sleep(0)
+        reset_task.cancel()
+        await asyncio.sleep(0)
+
+        task_finished_early = reset_task.done()
+        new_run_entered = app.state.workspace_lock.try_acquire()
+        if new_run_entered:
+            app.state.workspace_lock.release()
+
+        worker_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await reset_task
+
+    assert task_finished_early is False
+    assert new_run_entered is False
+    assert worker_done.is_set()
+    assert order == ["worker_done", "lock_release"]
+    assert app.state.workspace_lock.try_acquire()
+    app.state.workspace_lock.release()
 
 
 def test_websocket_disconnect_cancels_runner_and_waits_for_tool(
