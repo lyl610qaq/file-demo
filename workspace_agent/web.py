@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -45,6 +47,23 @@ _MAX_FORWARDED_FOR_CHARS = 2048
 _MAX_FORWARDED_FOR_HOPS = 20
 _MAX_TRUSTED_PROXY_CIDRS = 64
 _ORIGIN_ERROR = "allowed_origin must be a valid HTTP origin"
+_RESET_JOURNAL_NAME = ".workspace-reset-journal.json"
+_RESET_JOURNAL_TEMP_PATTERN = re.compile(
+    r"\.workspace-reset-journal-tmp-[0-9a-f]{32}\Z",
+    flags=re.ASCII,
+)
+_RESET_STAGING_PATTERN = re.compile(
+    r"\.workspace-reset-stage-[0-9a-f]{32}\Z",
+    flags=re.ASCII,
+)
+_RESET_BACKUP_PATTERN = re.compile(
+    r"\.workspace-reset-backup-[0-9a-f]{32}\Z",
+    flags=re.ASCII,
+)
+_RESET_PHASES = frozenset(
+    {"prepared", "backup-created", "workspace-installed"}
+)
+_MAX_RESET_JOURNAL_BYTES = 4096
 _TERMINAL_EVENT_TYPES = frozenset({"run_completed", "run_failed"})
 _SECURITY_HEADERS = {
     "Content-Security-Policy": (
@@ -357,17 +376,32 @@ def _runtime_roots_are_separate(paths: tuple[Path, ...]) -> bool:
 
 def _validate_seed_root(seed_root: Path) -> None:
     try:
-        metadata = os.lstat(seed_root)
-        if (
-            _is_link_or_reparse(metadata)
-            or not stat.S_ISDIR(metadata.st_mode)
-            or not os.access(seed_root, os.R_OK)
-        ):
+        if _count_readable_regular_files(seed_root) < 1:
             raise ValueError("seed root is invalid")
-        with os.scandir(seed_root) as entries:
-            next(entries)
-    except (OSError, StopIteration):
+    except (OSError, ValueError):
         raise ValueError("seed root is invalid") from None
+
+
+def _count_readable_regular_files(root: Path) -> int:
+    metadata = os.lstat(root)
+    if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("tree root is invalid")
+    count = 0
+    with os.scandir(root) as entries:
+        children = [Path(entry.path) for entry in entries]
+    for child in children:
+        child_metadata = os.lstat(child)
+        if _is_link_or_reparse(child_metadata):
+            raise ValueError("tree contains a non-physical entry")
+        if stat.S_ISDIR(child_metadata.st_mode):
+            count += _count_readable_regular_files(child)
+        elif stat.S_ISREG(child_metadata.st_mode):
+            with child.open("rb") as stream:
+                stream.read(1)
+            count += 1
+        else:
+            raise ValueError("tree contains an unsupported entry")
+    return count
 
 
 def _prepare_runtime_roots(settings: Settings) -> tuple[
@@ -436,21 +470,14 @@ def _validate_physical_tree(
     *,
     require_nonempty: bool = False,
 ) -> None:
-    metadata = os.lstat(root)
-    if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
-        raise _ResetError()
-    with os.scandir(root) as entries:
-        children = [Path(entry.path) for entry in entries]
-    if require_nonempty and not children:
-        raise _ResetError()
-    for child in children:
-        child_metadata = os.lstat(child)
-        if _is_link_or_reparse(child_metadata):
+    try:
+        file_count = _count_readable_regular_files(root)
+        if require_nonempty and file_count < 1:
             raise _ResetError()
-        if stat.S_ISDIR(child_metadata.st_mode):
-            _validate_physical_tree(child)
-        elif not stat.S_ISREG(child_metadata.st_mode):
-            raise _ResetError()
+    except _ResetError:
+        raise
+    except (OSError, ValueError):
+        raise _ResetError() from None
 
 
 def _cleanup_reset_path(path: Path) -> None:
@@ -458,57 +485,432 @@ def _cleanup_reset_path(path: Path) -> None:
         _remove_entry(path)
 
 
-def _reset_workspace(settings: Settings) -> None:
-    workspace_guard = WorkspaceGuard(settings.workspace_root)
-    seed_guard = WorkspaceGuard(settings.seed_root)
-    workspace = workspace_guard.root
-    parent = workspace.parent
-    staging = Path(
-        tempfile.mkdtemp(prefix=".workspace-reset-stage-", dir=parent)
-    )
-    backup = parent / f".workspace-reset-backup-{uuid.uuid4().hex}"
-
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
     try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_reset_journal(parent: Path, record: dict[str, Any]) -> None:
+    _validate_reset_journal_record(record, record.get("workspace"))
+    journal = parent / _RESET_JOURNAL_NAME
+    temporary = parent / (
+        f".workspace-reset-journal-tmp-{uuid.uuid4().hex}"
+    )
+    payload = json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    if len(payload) > _MAX_RESET_JOURNAL_BYTES:
+        raise _ResetError()
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = None
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, journal)
+        _fsync_directory(parent)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if os.path.lexists(temporary):
+            metadata = os.lstat(temporary)
+            if _is_link_or_reparse(metadata) or not stat.S_ISREG(
+                metadata.st_mode
+            ):
+                raise _ResetError()
+            os.unlink(temporary)
+
+
+def _validate_reset_journal_record(
+    record: object,
+    workspace_name: object,
+) -> dict[str, Any]:
+    if not isinstance(record, dict) or set(record) != {
+        "version",
+        "workspace",
+        "staging",
+        "backup",
+        "phase",
+    }:
+        raise ValueError("invalid reset journal")
+    if (
+        record.get("version") != 1
+        or not isinstance(workspace_name, str)
+        or record.get("workspace") != workspace_name
+        or not isinstance(record.get("staging"), str)
+        or _RESET_STAGING_PATTERN.fullmatch(record["staging"]) is None
+        or not isinstance(record.get("backup"), str)
+        or _RESET_BACKUP_PATTERN.fullmatch(record["backup"]) is None
+        or record["staging"] == record["backup"]
+        or record.get("phase") not in _RESET_PHASES
+    ):
+        raise ValueError("invalid reset journal")
+    return record
+
+
+def _load_reset_journal(parent: Path, workspace_name: str) -> dict[str, Any]:
+    journal = parent / _RESET_JOURNAL_NAME
+    metadata = os.lstat(journal)
+    if (
+        _is_link_or_reparse(metadata)
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size > _MAX_RESET_JOURNAL_BYTES
+    ):
+        raise ValueError("invalid reset journal")
+    with journal.open("rb") as stream:
+        payload = stream.read(_MAX_RESET_JOURNAL_BYTES + 1)
+    if len(payload) > _MAX_RESET_JOURNAL_BYTES:
+        raise ValueError("invalid reset journal")
+    try:
+        record = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("invalid reset journal") from None
+    return _validate_reset_journal_record(record, workspace_name)
+
+
+def _remove_reset_journal(parent: Path) -> None:
+    journal = parent / _RESET_JOURNAL_NAME
+    if not os.path.lexists(journal):
+        return
+    metadata = os.lstat(journal)
+    if _is_link_or_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("invalid reset journal")
+    os.unlink(journal)
+    _fsync_directory(parent)
+
+
+def _reset_candidate(
+    parent: Path,
+    basename: str,
+    pattern: re.Pattern[str],
+) -> Path:
+    if pattern.fullmatch(basename) is None:
+        raise ValueError("invalid reset candidate")
+    return parent / basename
+
+
+def _validate_recovery_directory(path: Path) -> None:
+    _count_readable_regular_files(path)
+
+
+def _cleanup_recovery_directory(
+    path: Path,
+    pattern: re.Pattern[str],
+) -> None:
+    if pattern.fullmatch(path.name) is None:
+        raise ValueError("invalid reset candidate")
+    if not os.path.lexists(path):
+        return
+    _validate_recovery_directory(path)
+    _cleanup_reset_path(path)
+
+
+def _cleanup_journal_temps(parent: Path) -> None:
+    with os.scandir(parent) as entries:
+        paths = [Path(entry.path) for entry in entries]
+    for path in paths:
+        if not path.name.startswith(".workspace-reset-journal-tmp-"):
+            continue
+        if _RESET_JOURNAL_TEMP_PATTERN.fullmatch(path.name) is None:
+            raise ValueError("invalid reset journal temporary")
+        metadata = os.lstat(path)
+        if _is_link_or_reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("invalid reset journal temporary")
+        os.unlink(path)
+        _fsync_directory(parent)
+
+
+def _tree_fingerprint(root: Path) -> dict[str, tuple[str, int, str]]:
+    result: dict[str, tuple[str, int, str]] = {}
+    metadata = os.lstat(root)
+    if _is_link_or_reparse(metadata) or not stat.S_ISDIR(metadata.st_mode):
+        raise ValueError("invalid physical tree")
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            children = [Path(entry.path) for entry in entries]
+        for child in children:
+            child_metadata = os.lstat(child)
+            if _is_link_or_reparse(child_metadata):
+                raise ValueError("invalid physical tree")
+            relative = child.relative_to(root).as_posix()
+            if stat.S_ISDIR(child_metadata.st_mode):
+                result[relative] = ("directory", 0, "")
+                pending.append(child)
+            elif stat.S_ISREG(child_metadata.st_mode):
+                digest = hashlib.sha256()
+                with child.open("rb") as stream:
+                    for chunk in iter(lambda: stream.read(65536), b""):
+                        digest.update(chunk)
+                result[relative] = (
+                    "file",
+                    child_metadata.st_size,
+                    digest.hexdigest(),
+                )
+            else:
+                raise ValueError("invalid physical tree")
+    return result
+
+
+def _physical_trees_equal(left: Path, right: Path) -> bool:
+    return _tree_fingerprint(left) == _tree_fingerprint(right)
+
+
+def _restore_reset_backup(
+    parent: Path,
+    workspace: Path,
+    staging: Path,
+    backup: Path,
+) -> None:
+    _validate_recovery_directory(backup)
+    if os.path.lexists(staging):
+        _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
+    if os.path.lexists(workspace):
+        _validate_recovery_directory(workspace)
+        os.replace(workspace, staging)
+        _fsync_directory(parent)
+    os.replace(backup, workspace)
+    _fsync_directory(parent)
+    if os.path.lexists(staging):
+        _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
+        _fsync_directory(parent)
+    _remove_reset_journal(parent)
+    _cleanup_journal_temps(parent)
+
+
+def _recover_journaled_reset(
+    settings: Settings,
+    parent: Path,
+    record: dict[str, Any],
+) -> None:
+    workspace = settings.workspace_root
+    staging = _reset_candidate(
+        parent,
+        record["staging"],
+        _RESET_STAGING_PATTERN,
+    )
+    backup = _reset_candidate(
+        parent,
+        record["backup"],
+        _RESET_BACKUP_PATTERN,
+    )
+    phase = record["phase"]
+    workspace_exists = os.path.lexists(workspace)
+    staging_exists = os.path.lexists(staging)
+    backup_exists = os.path.lexists(backup)
+
+    for candidate, exists in (
+        (workspace, workspace_exists),
+        (staging, staging_exists),
+        (backup, backup_exists),
+    ):
+        if exists:
+            _validate_recovery_directory(candidate)
+
+    if phase in {"prepared", "backup-created"}:
+        if backup_exists:
+            _restore_reset_backup(
+                parent,
+                workspace,
+                staging,
+                backup,
+            )
+            return
+        if phase == "prepared" and workspace_exists:
+            if staging_exists:
+                _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
+                _fsync_directory(parent)
+            _remove_reset_journal(parent)
+            _cleanup_journal_temps(parent)
+            return
+        raise ValueError("inconsistent reset journal")
+
+    if workspace_exists:
+        if _count_readable_regular_files(workspace) < 1:
+            if backup_exists:
+                _restore_reset_backup(
+                    parent,
+                    workspace,
+                    staging,
+                    backup,
+                )
+                return
+            raise ValueError("installed workspace is invalid")
+        if staging_exists:
+            _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
+        if backup_exists:
+            _cleanup_recovery_directory(backup, _RESET_BACKUP_PATTERN)
+        _fsync_directory(parent)
+        _remove_reset_journal(parent)
+        _cleanup_journal_temps(parent)
+        return
+    if backup_exists:
+        _restore_reset_backup(parent, workspace, staging, backup)
+        return
+    raise ValueError("inconsistent reset journal")
+
+
+def _legacy_reset_candidates(
+    parent: Path,
+) -> tuple[list[Path], list[Path], list[Path]]:
+    staging: list[Path] = []
+    backups: list[Path] = []
+    journal_temps: list[Path] = []
+    with os.scandir(parent) as entries:
+        paths = [Path(entry.path) for entry in entries]
+    for path in paths:
+        name = path.name
+        if name.startswith(".workspace-reset-stage-"):
+            if _RESET_STAGING_PATTERN.fullmatch(name) is None:
+                raise ValueError("invalid legacy reset candidate")
+            _validate_recovery_directory(path)
+            staging.append(path)
+        elif name.startswith(".workspace-reset-backup-"):
+            if _RESET_BACKUP_PATTERN.fullmatch(name) is None:
+                raise ValueError("invalid legacy reset candidate")
+            _validate_recovery_directory(path)
+            backups.append(path)
+        elif name.startswith(".workspace-reset-journal-tmp-"):
+            if _RESET_JOURNAL_TEMP_PATTERN.fullmatch(name) is None:
+                raise ValueError("invalid legacy journal temporary")
+            metadata = os.lstat(path)
+            if _is_link_or_reparse(metadata) or not stat.S_ISREG(
+                metadata.st_mode
+            ):
+                raise ValueError("invalid legacy journal temporary")
+            journal_temps.append(path)
+    return staging, backups, journal_temps
+
+
+def _recover_legacy_reset(settings: Settings, parent: Path) -> None:
+    staging, backups, journal_temps = _legacy_reset_candidates(parent)
+    if not staging and not backups and not journal_temps:
+        return
+    workspace = settings.workspace_root
+    workspace_exists = os.path.lexists(workspace)
+    if workspace_exists:
+        _validate_recovery_directory(workspace)
+
+    if not workspace_exists:
+        if len(backups) == 1:
+            for candidate in staging:
+                _cleanup_recovery_directory(candidate, _RESET_STAGING_PATTERN)
+            os.replace(backups[0], workspace)
+            _fsync_directory(parent)
+            for temporary in journal_temps:
+                os.unlink(temporary)
+            if journal_temps:
+                _fsync_directory(parent)
+            return
+        if backups or staging or journal_temps:
+            raise ValueError("ambiguous legacy reset state")
+        return
+
+    if len(backups) > 1:
+        raise ValueError("ambiguous legacy reset state")
+    if backups:
+        if not _physical_trees_equal(workspace, settings.seed_root):
+            raise ValueError("ambiguous legacy reset state")
+        _cleanup_recovery_directory(backups[0], _RESET_BACKUP_PATTERN)
+        _fsync_directory(parent)
+    for candidate in staging:
+        _cleanup_recovery_directory(candidate, _RESET_STAGING_PATTERN)
+        _fsync_directory(parent)
+    for temporary in journal_temps:
+        os.unlink(temporary)
+        _fsync_directory(parent)
+
+
+def _recover_workspace_state(settings: Settings) -> None:
+    parent = settings.workspace_root.parent
+    if not os.path.lexists(parent):
+        return
+    try:
+        parent_guard = WorkspaceGuard(parent)
+        parent = parent_guard.root
+        journal = parent / _RESET_JOURNAL_NAME
+        if os.path.lexists(journal):
+            record = _load_reset_journal(
+                parent,
+                settings.workspace_root.name,
+            )
+            _recover_journaled_reset(settings, parent, record)
+        else:
+            _recover_legacy_reset(settings, parent)
+    except (OSError, ValueError, _ResetError):
+        raise ValueError("workspace recovery failed") from None
+
+
+def _reset_workspace(settings: Settings) -> None:
+    try:
+        _recover_workspace_state(settings)
+        workspace_guard = WorkspaceGuard(settings.workspace_root)
+        seed_guard = WorkspaceGuard(settings.seed_root)
+        workspace = workspace_guard.root
+        parent = workspace.parent
+        staging = parent / f".workspace-reset-stage-{uuid.uuid4().hex}"
+        backup = parent / f".workspace-reset-backup-{uuid.uuid4().hex}"
+        os.mkdir(staging)
         staging_guard = WorkspaceGuard(staging)
         _copy_seed_directory(seed_guard, staging_guard)
         _validate_physical_tree(staging, require_nonempty=True)
-
+    except (OSError, ValueError, _ResetError):
         try:
-            os.replace(workspace, backup)
-        except OSError:
-            raise _ResetError() from None
-
-        try:
-            # Single-process deployment: this checked rename sequence assumes
-            # no malicious local process mutates these roots concurrently.
-            os.replace(staging, workspace)
-        except OSError:
-            try:
-                os.replace(backup, workspace)
-            except OSError:
-                raise _ResetError("RESET_ROLLBACK_FAILED") from None
-            try:
-                _cleanup_reset_path(staging)
-            except OSError:
-                raise _ResetError("RESET_CLEANUP_FAILED") from None
-            raise _ResetError() from None
-
-        try:
-            _cleanup_reset_path(backup)
-        except OSError:
-            raise _ResetError("RESET_CLEANUP_FAILED") from None
-    except _ResetError:
-        try:
-            _cleanup_reset_path(staging)
-        except OSError:
-            raise _ResetError("RESET_CLEANUP_FAILED") from None
-        raise
-    except Exception:
-        try:
-            _cleanup_reset_path(staging)
+            if "staging" in locals() and os.path.lexists(staging):
+                _cleanup_recovery_directory(staging, _RESET_STAGING_PATTERN)
         except OSError:
             raise _ResetError("RESET_CLEANUP_FAILED") from None
         raise _ResetError() from None
+
+    journal = {
+        "version": 1,
+        "workspace": workspace.name,
+        "staging": staging.name,
+        "backup": backup.name,
+        "phase": "prepared",
+    }
+    try:
+        _write_reset_journal(parent, journal)
+        os.replace(workspace, backup)
+        _fsync_directory(parent)
+        journal["phase"] = "backup-created"
+        _write_reset_journal(parent, journal)
+        os.replace(staging, workspace)
+        _fsync_directory(parent)
+        journal["phase"] = "workspace-installed"
+        _write_reset_journal(parent, journal)
+    except Exception:
+        try:
+            _recover_workspace_state(settings)
+        except ValueError:
+            raise _ResetError("RESET_ROLLBACK_FAILED") from None
+        raise _ResetError() from None
+
+    try:
+        _cleanup_reset_path(backup)
+        _fsync_directory(parent)
+        _remove_reset_journal(parent)
+        _cleanup_journal_temps(parent)
+    except Exception as error:
+        if isinstance(error, _ResetError):
+            raise
+        raise _ResetError("RESET_CLEANUP_FAILED") from None
 
 
 def _directory_is_empty(root: Path) -> bool:
@@ -842,6 +1244,7 @@ def create_app(
     model: Any | None = None,
 ) -> FastAPI:
     configured = settings or Settings()
+    _recover_workspace_state(configured)
     allowed_origin = _normalize_http_origin(configured.allowed_origin)
     trusted_proxy_networks = _parse_trusted_proxy_cidrs(
         configured.trusted_proxy_cidrs

@@ -77,6 +77,10 @@ class FailingModel:
         raise RuntimeError("api-key=server-secret path=C:/private")
 
 
+class SimulatedCrash(BaseException):
+    pass
+
+
 def settings_for(tmp_path: Path, **overrides: Any) -> Settings:
     workspace = tmp_path / "workspace"
     seed = tmp_path / "seed"
@@ -143,6 +147,17 @@ def post_reset(
 ):
     headers = {} if origin is None else {"origin": origin}
     return client.post("/api/reset", headers=headers)
+
+
+def reset_artifacts(parent: Path) -> list[Path]:
+    return sorted(
+        (
+            path
+            for path in parent.iterdir()
+            if path.name.startswith(".workspace-reset-")
+        ),
+        key=lambda path: path.name,
+    )
 
 
 def websocket_route_endpoint(app):
@@ -1390,6 +1405,60 @@ def test_create_app_rejects_empty_seed(tmp_path: Path) -> None:
     assert str(tmp_path) not in str(error.value)
 
 
+def test_create_app_rejects_seed_containing_only_empty_directories(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    (settings.seed_root / "seed.md").unlink()
+    (settings.seed_root / "empty" / "nested").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="^seed root is invalid$") as error:
+        create_app(settings, model=FinalOnlyModel())
+
+    assert str(tmp_path) not in str(error.value)
+
+
+def test_create_app_rejects_seed_without_a_readable_regular_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = settings_for(tmp_path)
+    seed_file = settings.seed_root / "seed.md"
+    original_open = Path.open
+
+    def deny_seed_read(path: Path, *args: Any, **kwargs: Any):
+        if path == seed_file and args and "r" in str(args[0]):
+            raise PermissionError("seed is unreadable")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_seed_read)
+
+    with pytest.raises(ValueError, match="^seed root is invalid$"):
+        create_app(settings, model=FinalOnlyModel())
+
+
+def test_reset_rejects_seed_with_only_empty_directories_and_preserves_workspace(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    app = create_app(settings, model=FinalOnlyModel())
+    (settings.seed_root / "seed.md").unlink()
+    (settings.seed_root / "empty" / "nested").mkdir(parents=True)
+
+    with TestClient(app) as client:
+        response = post_reset(client)
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "error_code": "RESET_FAILED",
+        "message": "Workspace reset failed",
+    }
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert not (settings.workspace_root / "empty").exists()
+
+
 def test_create_app_rejects_seed_root_link(tmp_path: Path) -> None:
     target = tmp_path / "seed-target"
     target.mkdir()
@@ -1450,6 +1519,7 @@ def test_reset_rejects_seed_link_and_preserves_old_workspace(
     tmp_path: Path,
 ) -> None:
     settings = settings_for(tmp_path)
+    app = create_app(settings, model=FinalOnlyModel())
     outside = tmp_path / "seed-outside"
     outside.mkdir()
     (outside / "payload.md").write_text("outside", encoding="utf-8")
@@ -1467,7 +1537,6 @@ def test_reset_rejects_seed_link_and_preserves_old_workspace(
         link.symlink_to(outside, target_is_directory=True)
 
     try:
-        app = create_app(settings, model=FinalOnlyModel())
         with TestClient(app) as client:
             response = post_reset(client)
 
@@ -1576,6 +1645,289 @@ def test_reset_reports_backup_cleanup_failure_without_leaking_paths(
     finally:
         for backup in backups:
             original_cleanup(backup)
+
+
+def test_create_app_recovers_user_workspace_after_crash_at_first_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    original_replace = web.os.replace
+
+    def crash_after_first_rename(
+        source: str | Path,
+        destination: str | Path,
+    ) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        original_replace(source, destination)
+        if (
+            source_path == settings.workspace_root
+            and destination_path.name.startswith(".workspace-reset-backup-")
+        ):
+            raise SimulatedCrash()
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(web.os, "replace", crash_after_first_rename)
+        with pytest.raises(SimulatedCrash):
+            web._reset_workspace(settings)
+
+    assert not settings.workspace_root.exists()
+    assert any(path.name.endswith("journal.json") for path in reset_artifacts(tmp_path))
+
+    create_app(settings, model=FinalOnlyModel())
+
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert not (settings.workspace_root / "seed.md").exists()
+    assert reset_artifacts(tmp_path) == []
+
+
+def test_create_app_conservatively_restores_backup_after_second_rename_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    original_replace = web.os.replace
+
+    def crash_after_second_rename(
+        source: str | Path,
+        destination: str | Path,
+    ) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        original_replace(source, destination)
+        if (
+            source_path.name.startswith(".workspace-reset-stage-")
+            and destination_path == settings.workspace_root
+        ):
+            raise SimulatedCrash()
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(web.os, "replace", crash_after_second_rename)
+        with pytest.raises(SimulatedCrash):
+            web._reset_workspace(settings)
+
+    assert (settings.workspace_root / "seed.md").is_file()
+    assert any(path.name.endswith("journal.json") for path in reset_artifacts(tmp_path))
+
+    create_app(settings, model=FinalOnlyModel())
+
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert not (settings.workspace_root / "seed.md").exists()
+    assert reset_artifacts(tmp_path) == []
+
+
+def test_create_app_finishes_installed_workspace_after_cleanup_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    original_cleanup = web._cleanup_reset_path
+
+    def crash_after_backup_cleanup(path: Path) -> None:
+        original_cleanup(path)
+        if path.name.startswith(".workspace-reset-backup-"):
+            raise SimulatedCrash()
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(web, "_cleanup_reset_path", crash_after_backup_cleanup)
+        with pytest.raises(SimulatedCrash):
+            web._reset_workspace(settings)
+
+    assert (settings.workspace_root / "seed.md").is_file()
+    assert any(path.name.endswith("journal.json") for path in reset_artifacts(tmp_path))
+
+    create_app(settings, model=FinalOnlyModel())
+
+    assert (settings.workspace_root / "seed.md").read_text(
+        encoding="utf-8"
+    ) == "seed"
+    assert not (settings.workspace_root / "a.md").exists()
+    assert reset_artifacts(tmp_path) == []
+
+
+def test_create_app_rejects_traversal_in_reset_journal_without_touching_outside(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    marker = outside / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    journal = tmp_path / ".workspace-reset-journal.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "workspace": "workspace",
+                "staging": "../outside",
+                "backup": ".workspace-reset-backup-" + "a" * 32,
+                "phase": "backup-created",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        with pytest.raises(
+            ValueError,
+            match="^workspace recovery failed$",
+        ):
+            create_app(settings, model=FinalOnlyModel())
+        assert marker.read_text(encoding="utf-8") == "keep"
+        assert (settings.workspace_root / "a.md").is_file()
+    finally:
+        shutil.rmtree(outside)
+
+
+def test_create_app_rejects_reparse_reset_journal(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    outside = tmp_path / "journal-target"
+    outside.mkdir()
+    journal = tmp_path / ".workspace-reset-journal.json"
+    if os.name == "nt":
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(journal), str(outside)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0:
+            pytest.skip(created.stderr or created.stdout)
+    else:
+        journal.symlink_to(outside, target_is_directory=True)
+
+    try:
+        with pytest.raises(
+            ValueError,
+            match="^workspace recovery failed$",
+        ):
+            create_app(settings, model=FinalOnlyModel())
+        assert (settings.workspace_root / "a.md").is_file()
+    finally:
+        if os.path.lexists(journal):
+            if os.name == "nt":
+                os.rmdir(journal)
+            else:
+                journal.unlink()
+
+
+def test_create_app_recovers_single_legacy_backup_and_cleans_staging(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    backup = tmp_path / (".workspace-reset-backup-" + "a" * 32)
+    staging = tmp_path / (".workspace-reset-stage-" + "b" * 32)
+    os.replace(settings.workspace_root, backup)
+    staging.mkdir()
+    (staging / "partial.md").write_text("partial", encoding="utf-8")
+
+    create_app(settings, model=FinalOnlyModel())
+
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert reset_artifacts(tmp_path) == []
+
+
+def test_create_app_rejects_multiple_legacy_backups_without_bootstrapping(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    first = tmp_path / (".workspace-reset-backup-" + "a" * 32)
+    second = tmp_path / (".workspace-reset-backup-" + "b" * 32)
+    os.replace(settings.workspace_root, first)
+    second.mkdir()
+    (second / "other.md").write_text("other", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="^workspace recovery failed$",
+    ):
+        create_app(settings, model=FinalOnlyModel())
+
+    assert not settings.workspace_root.exists()
+    assert (first / "a.md").read_text(encoding="utf-8") == "body"
+    assert (second / "other.md").read_text(encoding="utf-8") == "other"
+
+
+def test_create_app_cleans_legacy_backup_only_when_workspace_matches_seed(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    backup = tmp_path / (".workspace-reset-backup-" + "a" * 32)
+    staging = tmp_path / (".workspace-reset-stage-" + "b" * 32)
+    os.replace(settings.workspace_root, backup)
+    shutil.copytree(settings.seed_root, settings.workspace_root)
+    staging.mkdir()
+    (staging / "partial.md").write_text("partial", encoding="utf-8")
+
+    create_app(settings, model=FinalOnlyModel())
+
+    assert (settings.workspace_root / "seed.md").read_text(
+        encoding="utf-8"
+    ) == "seed"
+    assert reset_artifacts(tmp_path) == []
+
+
+def test_create_app_preserves_ambiguous_legacy_backup_and_fails_stably(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    backup = tmp_path / (".workspace-reset-backup-" + "a" * 32)
+    backup.mkdir()
+    (backup / "older.md").write_text("older", encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="^workspace recovery failed$",
+    ):
+        create_app(settings, model=FinalOnlyModel())
+
+    assert (settings.workspace_root / "a.md").read_text(
+        encoding="utf-8"
+    ) == "body"
+    assert (backup / "older.md").read_text(encoding="utf-8") == "older"
+
+
+def test_reset_journal_records_durable_phase_progression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from workspace_agent import web
+
+    settings = settings_for(tmp_path)
+    phases: list[str] = []
+    fsynced: list[Path] = []
+    original_write = web._write_reset_journal
+    original_fsync = web._fsync_directory
+
+    def record_phase(parent: Path, record: dict[str, Any]) -> None:
+        phases.append(record["phase"])
+        original_write(parent, record)
+
+    def record_fsync(path: Path) -> None:
+        fsynced.append(path)
+        original_fsync(path)
+
+    monkeypatch.setattr(web, "_write_reset_journal", record_phase)
+    monkeypatch.setattr(web, "_fsync_directory", record_fsync)
+
+    web._reset_workspace(settings)
+
+    assert phases == ["prepared", "backup-created", "workspace-installed"]
+    assert fsynced.count(tmp_path) >= 5
+    assert reset_artifacts(tmp_path) == []
 
 
 @pytest.mark.asyncio
