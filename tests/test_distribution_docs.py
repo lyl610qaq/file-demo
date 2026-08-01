@@ -273,6 +273,37 @@ def test_dockerignore_is_a_deny_all_allowlist() -> None:
     assert "!traces/**" not in meaningful
 
 
+def test_dockerignore_reexcludes_nested_secrets_after_source_allowlists() -> None:
+    lines = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    meaningful = [line for line in lines if line and not line.startswith("#")]
+    source_allowlists = (
+        "!workspace_agent/**",
+        "!static/**",
+        "!demo_workspace_seed/**",
+    )
+    nested_secret_exclusions = (
+        "**/.env",
+        "**/.env.*",
+        "**/*.pem",
+        "**/*.key",
+        "**/id_rsa",
+    )
+
+    assert set(source_allowlists).issubset(meaningful)
+    last_source_allowlist = max(meaningful.index(pattern) for pattern in source_allowlists)
+    for pattern in nested_secret_exclusions:
+        assert pattern in meaningful
+        assert meaningful.index(pattern) > last_source_allowlist
+    last_example_allowlist = max(
+        index
+        for index, pattern in enumerate(meaningful)
+        if pattern == "!.env.example"
+    )
+    assert last_example_allowlist > max(
+        meaningful.index(pattern) for pattern in nested_secret_exclusions
+    )
+
+
 def test_railway_configuration_declares_docker_healthcheck_and_restart_policy() -> None:
     railway = ROOT / "railway.toml"
 

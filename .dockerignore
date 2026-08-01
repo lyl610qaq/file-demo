@@ -22,3 +22,13 @@ traces/
 !static/**
 !demo_workspace_seed/
 !demo_workspace_seed/**
+
+# Docker uses the last matching rule, so re-exclude nested secrets here.
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/id_rsa
+
+# The Dockerfile needs this committed, empty-key example configuration.
+!.env.example
