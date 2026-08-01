@@ -1,17 +1,24 @@
-.git
-.pytest_cache
-.ruff_cache
-__pycache__
-*.py[cod]
-*.egg-info
-.venv
-venv
-.env
-workspace
-traces
+# Send no unlisted files to a local or remote Docker builder.
+**
+
+# These exclusions document particularly sensitive or runtime-only paths.
+.env*
+certs/
+tests/
+.git/
+workspace/
+traces/
 .workspace-reset-*
-playwright-report
-test-results
-coverage
-node_modules
-tests
+
+# Minimal build context.
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!README.md
+!.env.example
+!workspace_agent/
+!workspace_agent/**
+!static/
+!static/**
+!demo_workspace_seed/
+!demo_workspace_seed/**
