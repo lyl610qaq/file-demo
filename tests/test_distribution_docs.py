@@ -52,6 +52,20 @@ def _docker_daemon_is_available() -> bool:
     return completed.returncode == 0 and bool(completed.stdout.strip())
 
 
+def _container_pid_one_uid(container: str) -> str:
+    completed = subprocess.run(
+        ["docker", "exec", container, "cat", "/proc/1/status"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    uid_line = next(
+        line for line in completed.stdout.splitlines() if line.startswith("Uid:")
+    )
+    return uid_line.split()[1]
+
+
 @pytest.mark.parametrize("raw, expected", [(None, 8000), ("1", 1), ("8000", 8000), ("65535", 65535)])
 def test_container_entrypoint_accepts_ascii_decimal_ports(
     raw: str | None,
@@ -227,7 +241,8 @@ def test_dockerfile_uses_the_validated_entrypoint_and_preserves_app_assets() -> 
     assert "TRACE_ROOT=/data/traces" in text
     assert "mkdir -p /data" in text
     assert "chmod 1777 /data" in text
-    assert "USER 10001" in text
+    assert "USER root" in text
+    assert "USER 10001" not in text
     assert "chown -R /app" not in text
     assert "ENTRYPOINT [\"python\", \"-m\", \"workspace_agent.container_entrypoint\"]" in text
     assert "sh\", \"-c" not in text
@@ -296,9 +311,11 @@ def test_readme_has_hugging_face_frontmatter_and_portable_platform_facts() -> No
     for phrase in (
         "ALLOWED_ORIGIN",
         "TRUSTED_PROXY_CIDRS",
-        "RAILWAY_RUN_UID=0",
         "https://docs.railway.com/volumes",
+        "默认以 root 启动入口",
+        "UID 10001",
         "UID 1000",
+        "主机目录或数据卷",
         "app_port: 8000",
         "https://huggingface.co/docs/hub/main/spaces-sdks-docker",
         "WebSocket",
@@ -313,6 +330,7 @@ def test_readme_has_hugging_face_frontmatter_and_portable_platform_facts() -> No
         "Python 3.12",
     ):
         assert phrase in text
+    assert "RAILWAY_RUN_UID=0" not in text
 
 
 def test_notes_are_chinese_and_do_not_contain_absolute_local_paths_or_api_key_values() -> None:
@@ -334,12 +352,13 @@ def test_gitignore_keeps_versioned_assets_but_ignores_runtime_data_and_reset_art
     assert "demo_workspace_seed/" not in ignored
 
 
-def test_container_image_serves_health_as_the_runtime_user() -> None:
+def test_container_image_initializes_a_root_owned_named_volume_then_drops_privileges() -> None:
     if not _docker_daemon_is_available():
-        pytest.skip("Docker daemon is unavailable")
+        pytest.skip("Docker daemon unavailable; volume initialization integration test skipped")
 
     image = f"workspace-agent-test:{uuid.uuid4().hex}"
     container = f"workspace-agent-test-{uuid.uuid4().hex}"
+    volume = f"workspace-agent-data-{uuid.uuid4().hex}"
     host_port = _free_local_port()
     try:
         subprocess.run(
@@ -350,6 +369,34 @@ def test_container_image_serves_health_as_the_runtime_user() -> None:
             timeout=300,
         )
         subprocess.run(
+            ["docker", "volume", "create", volume],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        root_owned = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--user",
+                "0",
+                "--mount",
+                f"type=volume,src={volume},dst=/data",
+                "--entrypoint",
+                "python",
+                image,
+                "-c",
+                "import os; print(os.stat('/data').st_uid)",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert root_owned.stdout.strip() == "0"
+        subprocess.run(
             [
                 "docker",
                 "run",
@@ -358,6 +405,8 @@ def test_container_image_serves_health_as_the_runtime_user() -> None:
                 container,
                 "--publish",
                 f"127.0.0.1:{host_port}:8000",
+                "--mount",
+                f"type=volume,src={volume},dst=/data",
                 image,
             ],
             check=True,
@@ -378,17 +427,17 @@ def test_container_image_serves_health_as_the_runtime_user() -> None:
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.2)
-        completed = subprocess.run(
-            ["docker", "exec", container, "id", "-u"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        assert completed.stdout.strip() == "10001"
+        assert _container_pid_one_uid(container) == "10001"
     finally:
         subprocess.run(
             ["docker", "rm", "--force", container],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        subprocess.run(
+            ["docker", "volume", "rm", volume],
             check=False,
             capture_output=True,
             text=True,

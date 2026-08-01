@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir . \
     && mkdir -p /data \
     && chmod 1777 /data
 
-USER 10001
+USER root
 
 EXPOSE 8000
 
