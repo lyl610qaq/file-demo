@@ -1709,6 +1709,7 @@ def create_app(
             "model": configured.llm_model,
             "configured": app.state.model is not None,
             "max_run_seconds": configured.max_run_seconds,
+            "max_read_bytes": configured.max_read_bytes,
         }
 
     @app.get("/api/tree")

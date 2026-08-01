@@ -43,6 +43,7 @@
     resetting: false,
     modelConfigured: false,
     maxRunSeconds: null,
+    maxReadBytes: 1024,
     terminalSeen: false,
     lastModelCall: -1,
     lastUsageModelCalls: -1,
@@ -886,13 +887,14 @@
     let encoding = "文本";
     let truncated = false;
     const seenCursors = new Set();
+    const pageLimit = Math.min(FILE_PAGE_BYTES, state.maxReadBytes);
 
     try {
       for (let pageNumber = 0; pageNumber < FILE_MAX_PAGES; pageNumber += 1) {
         const params = new URLSearchParams({
           path,
           offset: String(expectedOffset),
-          limit: String(FILE_PAGE_BYTES),
+          limit: String(pageLimit),
         });
         if (cursor) {
           params.set("cursor", cursor);
@@ -1620,13 +1622,17 @@
           "model",
           "configured",
           "max_run_seconds",
+          "max_read_bytes",
         ]) ||
         typeof meta.model !== "string" ||
         typeof meta.configured !== "boolean" ||
         typeof meta.max_run_seconds !== "number" ||
         !Number.isFinite(meta.max_run_seconds) ||
         meta.max_run_seconds <= 0 ||
-        meta.max_run_seconds > 3600
+        meta.max_run_seconds > 3600 ||
+        !Number.isInteger(meta.max_read_bytes) ||
+        meta.max_read_bytes < 1024 ||
+        meta.max_read_bytes > FILE_PAGE_BYTES
       ) {
         throw userError(
           "INVALID_META",
@@ -1635,6 +1641,7 @@
       }
       state.modelConfigured = meta.configured;
       state.maxRunSeconds = meta.max_run_seconds;
+      state.maxReadBytes = meta.max_read_bytes;
       setModelStatus(
         meta.configured
           ? `${meta.model} · 已连接`

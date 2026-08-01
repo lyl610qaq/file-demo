@@ -526,6 +526,7 @@ async function createHarness(fetchRoute, options = {}) {
         model: "test-model",
         configured: true,
         max_run_seconds: 1,
+        max_read_bytes: 65536,
       });
     }
     if (url.startsWith("/api/tree")) {
@@ -609,7 +610,47 @@ const configuredMeta = (seconds = 1) =>
     model: "test-model",
     configured: true,
     max_run_seconds: seconds,
+    max_read_bytes: 65536,
   });
+
+test("file preview uses the configured read limit", async () => {
+  let fileUrl = null;
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return jsonResponse({
+        model: "test-model",
+        configured: true,
+        max_run_seconds: 1,
+        max_read_bytes: 16384,
+      });
+    }
+    if (url.startsWith("/api/tree")) {
+      return jsonResponse({
+        entries: [{ path: "owners.csv", type: "file", size: 4 }],
+        warnings: [],
+        has_more: false,
+        next_cursor: null,
+      });
+    }
+    if (url.startsWith("/api/file")) {
+      fileUrl = new URL(url, "http://testserver");
+      return jsonResponse({
+        path: "owners.csv",
+        content: "name",
+        offset: 0,
+        next_offset: 4,
+        has_more: false,
+        encoding: "utf-8",
+        next_cursor: null,
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  await fileButton(harness, "owners.csv").click();
+
+  assert.equal(fileUrl.searchParams.get("limit"), "16384");
+});
 
 test("a slow file response cannot replace a newer file preview", async () => {
   const slowA = deferred();

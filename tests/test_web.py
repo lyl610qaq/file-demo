@@ -213,6 +213,7 @@ def test_index_assets_health_meta_tree_file_and_reset(tmp_path: Path) -> None:
             "model": "gpt-4.1-mini",
             "configured": True,
             "max_run_seconds": 300.0,
+            "max_read_bytes": 16384,
         }
         assert client.get("/api/tree").json()["entries"][0]["path"] == "a.md"
         assert client.get("/api/file", params={"path": "a.md"}).json()[
