@@ -520,6 +520,44 @@ def test_websocket_compares_normalized_origin_components(tmp_path: Path) -> None
 @pytest.mark.parametrize(
     "origin",
     [
+        "https://file-demo-production.up.railway.app",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+)
+def test_reset_accepts_configured_and_fixed_local_origins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+) -> None:
+    from workspace_agent import web
+
+    calls = 0
+
+    def tracked_reset(settings: Settings) -> None:
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(web, "_reset_workspace", tracked_reset)
+    app = create_app(
+        settings_for(
+            tmp_path,
+            allowed_origin="https://file-demo-production.up.railway.app",
+        ),
+        model=FinalOnlyModel(),
+    )
+
+    with TestClient(app) as client:
+        response = post_reset(client, origin=origin)
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "reset"}
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
         None,
         "null",
         "ws://testserver",
@@ -1306,6 +1344,9 @@ def test_run_is_rejected_while_reset_holds_the_workspace_gate(
         "https://cross-site.example",
         "http://testserver/path",
         "http://testserver.evil.example",
+        "http://localhost:8001",
+        "http://127.0.0.1:8001",
+        "http://localhost.evil:8000",
     ],
 )
 def test_reset_rejects_non_same_origin_without_running_worker(

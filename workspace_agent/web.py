@@ -1782,7 +1782,7 @@ def create_app(
             )
         except ValueError:
             request_origin = None
-        if request_origin != app.state.allowed_origin:
+        if request_origin not in app.state.allowed_origins:
             raise HTTPException(
                 status_code=403,
                 detail={
