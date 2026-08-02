@@ -31,6 +31,8 @@ uvicorn workspace_agent.web:app --host 127.0.0.1 --port 8000
 
 `ALLOWED_ORIGIN` 必须是一个规范化的 HTTP/HTTPS origin。公网部署使用自己的 HTTPS 地址并由平台或反向代理终止 TLS。`TRUSTED_PROXY_CIDRS` 默认空白；只有核实反向代理出口网段后，才可以信任 `X-Forwarded-For`。
 
+服务端还固定允许 `http://localhost:8000` 和 `http://127.0.0.1:8000` 访问 `/ws/agent` 与 `/api/reset`；其他本地端口仍会被拒绝。这个规则也存在于公网部署中，因此只有在信任本机 8000 端口所运行页面的前提下使用。不要改成通配符、后缀匹配或关闭 Origin 校验。
+
 服务只有单个可变工作区，reset 与 Agent run 在单进程内互斥；内存限流、连接数和锁均不跨实例共享。不要用多个 Uvicorn worker 或多个副本来运行它。reset 使用 durable `reset journal v3`；部署前应备份持久卷中的 `workspace/` 与 `traces/`。
 
 ## Docker
