@@ -379,6 +379,87 @@ def test_websocket_rejects_wrong_origin_before_accept(tmp_path: Path) -> None:
     assert rejected.value.code == 1008
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://file-demo-production.up.railway.app",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
+)
+def test_websocket_accepts_configured_and_fixed_local_origins(
+    tmp_path: Path,
+    origin: str,
+) -> None:
+    app = create_app(
+        settings_for(
+            tmp_path,
+            allowed_origin="https://file-demo-production.up.railway.app",
+        ),
+        model=FinalOnlyModel(),
+    )
+
+    with TestClient(app) as client:
+        with client.websocket_connect(
+            "/ws/agent",
+            headers={"origin": origin},
+        ) as socket:
+            socket.send_json({"type": "run", "task": "Inspect files"})
+            events = receive_until_terminal(socket)
+
+    assert events[-1]["type"] == "run_completed"
+
+
+def test_origin_set_deduplicates_a_configured_fixed_local_origin(
+    tmp_path: Path,
+) -> None:
+    app = create_app(
+        settings_for(
+            tmp_path,
+            allowed_origin="HTTP://LOCALHOST:8000",
+        ),
+        model=FinalOnlyModel(),
+    )
+
+    assert app.state.allowed_origins == frozenset(
+        {
+            ("http", "localhost", 8000),
+            ("http", "127.0.0.1", 8000),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:8001",
+        "http://127.0.0.1:8001",
+        "http://localhost.evil:8000",
+    ],
+)
+def test_websocket_rejects_non_allowed_local_origins(
+    tmp_path: Path,
+    origin: str,
+) -> None:
+    app = create_app(
+        settings_for(
+            tmp_path,
+            allowed_origin="https://file-demo-production.up.railway.app",
+        ),
+        model=FinalOnlyModel(),
+    )
+
+    with TestClient(app) as client:
+        with pytest.raises(WebSocketDisconnect) as rejected:
+            with client.websocket_connect(
+                "/ws/agent",
+                headers={"origin": origin},
+            ):
+                pass
+
+    assert rejected.value.code == 1008
+
+
 @pytest.mark.parametrize("allowed_origin", ["", " ", "\t\r\n"])
 def test_create_app_rejects_blank_allowed_origin(
     tmp_path: Path,

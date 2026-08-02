@@ -47,6 +47,10 @@ _MAX_FORWARDED_FOR_CHARS = 2048
 _MAX_FORWARDED_FOR_HOPS = 20
 _MAX_TRUSTED_PROXY_CIDRS = 64
 _ORIGIN_ERROR = "allowed_origin must be a valid HTTP origin"
+_FIXED_LOCAL_ORIGIN_VALUES = (
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+)
 _RESET_JOURNAL_NAME = ".workspace-reset-journal.json"
 _RESET_JOURNAL_TEMP_PATTERN = re.compile(
     r"\.workspace-reset-journal-tmp-[0-9a-f]{32}\Z",
@@ -1613,7 +1617,13 @@ def create_app(
 ) -> FastAPI:
     configured = settings or Settings()
     _recover_workspace_state(configured)
-    allowed_origin = _normalize_http_origin(configured.allowed_origin)
+    allowed_origins = frozenset(
+        _normalize_http_origin(origin)
+        for origin in (
+            configured.allowed_origin,
+            *_FIXED_LOCAL_ORIGIN_VALUES,
+        )
+    )
     trusted_proxy_networks = _parse_trusted_proxy_cidrs(
         configured.trusted_proxy_cidrs
     )
@@ -1656,7 +1666,7 @@ def create_app(
     app.state.tools = tools
     app.state.traces = traces
     app.state.model = model
-    app.state.allowed_origin = allowed_origin
+    app.state.allowed_origins = allowed_origins
     app.state.trusted_proxy_networks = trusted_proxy_networks
     app.state.workspace_lock = _CapacityGate(1)
     app.state.run_slots = _CapacityGate(configured.max_concurrent_runs)
@@ -1857,7 +1867,7 @@ def create_app(
         except ValueError:
             await socket.close(code=1008, reason="origin rejected")
             return
-        if request_origin != app.state.allowed_origin:
+        if request_origin not in app.state.allowed_origins:
             await socket.close(code=1008, reason="origin rejected")
             return
 
