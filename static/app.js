@@ -7,7 +7,7 @@
   const TREE_MAX_ENTRIES = 5000;
   const TREE_MAX_JSON_BYTES = 2 * 1024 * 1024;
   const FILE_PAGE_BYTES = 65536;
-  const FILE_MAX_PAGE_REQUESTS = 1024;
+  const FILE_MAX_PAGE_REQUESTS = 2048;
   const FILE_MAX_PREVIEW_BYTES = 1024 * 1024;
   const MAX_JSON_RESPONSE_BYTES = 2 * 1024 * 1024;
   const MAX_SOCKET_EVENT_CHARS = 256 * 1024;
@@ -888,13 +888,13 @@
     let truncated = false;
     const seenCursors = new Set();
     const pageLimit = Math.min(FILE_PAGE_BYTES, state.maxReadBytes);
-    const pageRequestCap = Math.min(
-      FILE_MAX_PAGE_REQUESTS,
-      Math.ceil(FILE_MAX_PREVIEW_BYTES / pageLimit),
-    );
 
     try {
-      for (let pageNumber = 0; pageNumber < pageRequestCap; pageNumber += 1) {
+      for (
+        let pageNumber = 0;
+        pageNumber < FILE_MAX_PAGE_REQUESTS;
+        pageNumber += 1
+      ) {
         const params = new URLSearchParams({
           path,
           offset: String(expectedOffset),
@@ -970,7 +970,7 @@
         cursor = page.nextCursor;
         if (
           contentBytes >= FILE_MAX_PREVIEW_BYTES ||
-          pageNumber + 1 >= pageRequestCap
+          pageNumber + 1 >= FILE_MAX_PAGE_REQUESTS
         ) {
           truncated = true;
           break;

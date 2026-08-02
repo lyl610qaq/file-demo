@@ -700,6 +700,93 @@ test("a one KiB read limit can fill the one MiB preview budget", async () => {
   assert.ok(fileUrls.every((url) => url.searchParams.get("limit") === "1024"));
 });
 
+test("Chinese boundary pages use actual byte progress to fill the preview", async () => {
+  let page = 0;
+  const fileUrls = [];
+  const pageContent = "中".repeat(341);
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return jsonResponse({
+        model: "test-model",
+        configured: true,
+        max_run_seconds: 1,
+        max_read_bytes: 1024,
+      });
+    }
+    if (url.startsWith("/api/tree")) {
+      return jsonResponse({
+        entries: [{ path: "large.txt", type: "file", size: 2 * 1024 * 1024 }],
+        warnings: [],
+        has_more: false,
+        next_cursor: null,
+      });
+    }
+    if (url.startsWith("/api/file")) {
+      const currentPage = page;
+      page += 1;
+      fileUrls.push(new URL(url, "http://testserver"));
+      return jsonResponse({
+        path: "large.txt",
+        content: pageContent,
+        offset: currentPage * 1023,
+        next_offset: (currentPage + 1) * 1023,
+        has_more: true,
+        encoding: "utf-8",
+        next_cursor: `page-${currentPage + 1}`,
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  await fileButton(harness, "large.txt").click();
+
+  assert.equal(fileUrls.length, 1026);
+  assert.equal(
+    UTF8_ENCODER.encode(
+      harness.document.getElementById("file-content").textContent,
+    ).byteLength,
+    1025 * 1023,
+  );
+  assert.ok(fileUrls.every((url) => url.searchParams.get("limit") === "1024"));
+});
+
+test("metadata failure keeps tree browsing on the safe read limit", async () => {
+  let fileUrl = null;
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return jsonResponse(
+        { detail: { error_code: "UNAVAILABLE" } },
+        { status: 503 },
+      );
+    }
+    if (url.startsWith("/api/tree")) {
+      return jsonResponse({
+        entries: [{ path: "owners.csv", type: "file", size: 4 }],
+        warnings: [],
+        has_more: false,
+        next_cursor: null,
+      });
+    }
+    if (url.startsWith("/api/file")) {
+      fileUrl = new URL(url, "http://testserver");
+      return jsonResponse({
+        path: "owners.csv",
+        content: "name",
+        offset: 0,
+        next_offset: 4,
+        has_more: false,
+        encoding: "utf-8",
+        next_cursor: null,
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  await fileButton(harness, "owners.csv").click();
+
+  assert.equal(fileUrl.searchParams.get("limit"), "1024");
+});
+
 test("file selection waits for metadata before rendering the tree", async () => {
   const metadata = deferred();
   const fileUrls = [];
