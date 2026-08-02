@@ -33,6 +33,9 @@ uvicorn workspace_agent.web:app --host 127.0.0.1 --port 8000
 
 服务只有单个可变工作区，reset 与 Agent run 在单进程内互斥；内存限流、连接数和锁均不跨实例共享。不要用多个 Uvicorn worker 或多个副本来运行它。reset 使用 durable `reset journal v3`；部署前应备份持久卷中的 `workspace/` 与 `traces/`。
 
+启动脚本
+agent.bat
+
 ## Docker
 
 镜像使用 `python:3.12-slim`，默认以 root 启动入口，只用于初始化挂载卷中的固定目录；`workspace_agent.container_entrypoint` 验证 `PORT` 是 1 到 65535 的十进制端口，只初始化 `/data/workspace` 和 `/data/traces`，随后立即降权为 UID 10001 再执行 Uvicorn。应用进程始终以 UID 10001 运行。它不是 Agent CLI。
