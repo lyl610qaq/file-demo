@@ -584,13 +584,17 @@ async function createHarness(fetchRoute, options = {}) {
   });
 
   vm.runInContext(APP_SOURCE, context, { filename: "static/app.js" });
-  await document.fireDOMContentLoaded();
-  await flush();
+  const startup = document.fireDOMContentLoaded();
+  if (options.waitForStartup !== false) {
+    await startup;
+    await flush();
+  }
   return {
     clock,
     document,
     fetchCalls,
     sockets,
+    startup,
   };
 }
 
@@ -650,6 +654,107 @@ test("file preview uses the configured read limit", async () => {
   await fileButton(harness, "owners.csv").click();
 
   assert.equal(fileUrl.searchParams.get("limit"), "16384");
+});
+
+test("a one KiB read limit can fill the one MiB preview budget", async () => {
+  let page = 0;
+  const fileUrls = [];
+  const harness = await createHarness(async (url) => {
+    if (url === "/api/meta") {
+      return jsonResponse({
+        model: "test-model",
+        configured: true,
+        max_run_seconds: 1,
+        max_read_bytes: 1024,
+      });
+    }
+    if (url.startsWith("/api/tree")) {
+      return jsonResponse({
+        entries: [{ path: "large.txt", type: "file", size: 1024 * 1024 }],
+        warnings: [],
+        has_more: false,
+        next_cursor: null,
+      });
+    }
+    if (url.startsWith("/api/file")) {
+      const currentPage = page;
+      page += 1;
+      fileUrls.push(new URL(url, "http://testserver"));
+      return jsonResponse({
+        path: "large.txt",
+        content: "x".repeat(1024),
+        offset: currentPage * 1024,
+        next_offset: (currentPage + 1) * 1024,
+        has_more: currentPage < 1023,
+        encoding: "utf-8",
+        next_cursor: currentPage < 1023 ? `page-${currentPage + 1}` : null,
+      });
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  });
+
+  await fileButton(harness, "large.txt").click();
+
+  assert.equal(fileUrls.length, 1024);
+  assert.equal(harness.document.getElementById("file-content").textContent.length, 1024 * 1024);
+  assert.ok(fileUrls.every((url) => url.searchParams.get("limit") === "1024"));
+});
+
+test("file selection waits for metadata before rendering the tree", async () => {
+  const metadata = deferred();
+  const fileUrls = [];
+  let treeRequests = 0;
+  const harness = await createHarness(
+    async (url) => {
+      if (url === "/api/meta") {
+        return metadata.promise;
+      }
+      if (url.startsWith("/api/tree")) {
+        treeRequests += 1;
+        return jsonResponse({
+          entries: [{ path: "owners.csv", type: "file", size: 4 }],
+          warnings: [],
+          has_more: false,
+          next_cursor: null,
+        });
+      }
+      if (url.startsWith("/api/file")) {
+        fileUrls.push(new URL(url, "http://testserver"));
+        return jsonResponse({
+          path: "owners.csv",
+          content: "name",
+          offset: 0,
+          next_offset: 4,
+          has_more: false,
+          encoding: "utf-8",
+          next_cursor: null,
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+    { waitForStartup: false },
+  );
+
+  for (let index = 0; index < 4; index += 1) {
+    await flush();
+  }
+  const treeRequestsBeforeMetadata = treeRequests;
+
+  metadata.resolve(
+    jsonResponse({
+      model: "test-model",
+      configured: true,
+      max_run_seconds: 1,
+      max_read_bytes: 16384,
+    }),
+  );
+  await harness.startup;
+  await flush();
+  await fileButton(harness, "owners.csv").click();
+
+  assert.equal(treeRequestsBeforeMetadata, 0);
+  assert.equal(fileUrls.length, 1);
+  assert.equal(fileUrls[0].searchParams.get("limit"), "16384");
 });
 
 test("a slow file response cannot replace a newer file preview", async () => {
